@@ -18,6 +18,8 @@ import PIL.Image
 
 import tfutil
 import dataset
+#from scipy.ndimage.interpolation import map_coordinates
+from scipy.ndimage.filters import gaussian_filter
 
 #----------------------------------------------------------------------------
 
@@ -76,12 +78,24 @@ class TFRecordExporter:
         for lod, tfr_writer in enumerate(self.tfr_writers):
             if lod:
                 img = img.astype(np.float32)
-                img = (img[:, 0::2, 0::2] + img[:, 0::2, 1::2] + img[:, 1::2, 0::2] + img[:, 1::2, 1::2]) * 0.25
-            quant = np.rint(img).clip(0, 255).astype(np.uint8)
-            ex = tf.train.Example(features=tf.train.Features(feature={
-                'shape': tf.train.Feature(int64_list=tf.train.Int64List(value=quant.shape)),
-                'data': tf.train.Feature(bytes_list=tf.train.BytesList(value=[quant.tostring()]))}))
-            tfr_writer.write(ex.SerializeToString())
+                img = img[:, 0::2, 0::2] # + img[:, 0::2, 1::2] + img[:, 1::2, 0::2] + img[:, 1::2, 1::2]) * 0.25
+
+            if np.max(img.shape) in [1024, 512]:
+                n = 1
+            elif np.max(img.shape) in [256]:
+                n = 256
+            elif np.max(img.shape) in [128, 16, 8, 4]:
+                n = 1024
+            elif np.max(img.shape) in [64, 32]:
+                n = 2048
+
+            for aug_s in range(n):
+                augimg = elastic_steps(img)
+                quant = np.rint(augimg).clip(0, 255).astype(np.uint8)
+                ex = tf.train.Example(features=tf.train.Features(feature={
+                    'shape': tf.train.Feature(int64_list=tf.train.Int64List(value=quant.shape)),
+                    'data': tf.train.Feature(bytes_list=tf.train.BytesList(value=[quant.tostring()]))}))
+                tfr_writer.write(ex.SerializeToString())
         self.cur_images += 1
 
     def add_labels(self, labels):
@@ -597,7 +611,7 @@ def create_celebahq(tfrecord_dir, celeba_dir, delta_dir, num_threads=4, num_task
 
 def create_from_images(tfrecord_dir, image_dir, shuffle):
     print('Loading images from "%s"' % image_dir)
-    image_filenames = sorted(glob.glob(os.path.join(image_dir, '*')))
+    image_filenames = sorted(glob.glob(image_dir, recursive=True))
     if len(image_filenames) == 0:
         error('No input images found')
         
@@ -610,7 +624,7 @@ def create_from_images(tfrecord_dir, image_dir, shuffle):
         error('Input image resolution must be a power-of-two')
     if channels not in [1, 3]:
         error('Input images must be stored as RGB or grayscale')
-    
+
     with TFRecordExporter(tfrecord_dir, len(image_filenames)) as tfr:
         order = tfr.choose_shuffled_order() if shuffle else np.arange(len(image_filenames))
         for idx in range(order.size):
@@ -731,6 +745,94 @@ def execute_cmdline(argv):
     func = globals()[args.command]
     del args.command
     func(**vars(args))
+
+#----------------------------------------------------------------------------
+
+def elastic_transform(image, alpha, sigma, random_state=None):
+        """Elastic deformation of images as described in [Simard2003]_ (with modifications).
+        .. [Simard2003] Simard, Steinkraus and Platt, "Best Practices for
+             Convolutional Neural Networks applied to Visual Document Analysis", in
+             Proc. of the International Conference on Document Analysis and
+             Recognition, 2003.
+         Based on https://gist.github.com/erniejunior/601cdf56d2b424757de5
+        """
+
+        if random_state is None:
+            random_state = np.random.RandomState(None)
+
+        shape = image.shape
+
+        dx = gaussian_filter((random_state.rand(*shape) * 2 - 1), sigma) * alpha
+        dy = gaussian_filter((random_state.rand(*shape) * 2 - 1), sigma) * alpha
+
+        dx = np.round(dx).astype(int)
+        dy = np.round(dy).astype(int)
+
+        x, y = np.meshgrid(np.arange(np.max(shape)), np.arange(np.max(shape)))
+        indices = np.reshape(y+dy, (-1, 1)), np.reshape(x+dx, (-1, 1))
+
+        return map_coordinates(image, indices, order=1, mode='reflect').reshape(shape)
+
+#----------------------------------------------------------------------------
+
+def elastic_steps(img, random_state=None):
+    if np.max(img.shape)==512:
+        img = elastic_transform(img, np.max(img.shape) * 3, np.max(img.shape) * 0.09, random_state=random_state)
+    elif np.max(img.shape)==256:
+        img = elastic_transform(img, np.max(img.shape) * 2, np.max(img.shape) * 0.07, random_state=random_state)
+    elif np.max(img.shape)==128:
+        img = elastic_transform(img, np.max(img.shape) * 1, np.max(img.shape) * 0.07, random_state=random_state)
+    elif np.max(img.shape)==64:
+        img = elastic_transform(img, np.max(img.shape) * 1, np.max(img.shape) * 0.08, random_state=random_state)
+    elif np.max(img.shape)==32:
+        img = elastic_transform(img, np.max(img.shape) * 1, np.max(img.shape) * 0.1, random_state=random_state)
+    elif np.max(img.shape)==16:
+        img = elastic_transform(img, np.max(img.shape) * 1, np.max(img.shape) * 0.2, random_state=random_state)
+    elif np.max(img.shape)==8:
+        img = elastic_transform(img, np.max(img.shape) * 1, np.max(img.shape) * 0.3, random_state=random_state)
+    elif np.max(img.shape)==4:
+        img = elastic_transform(img, np.max(img.shape) * 1, np.max(img.shape) * 0.4, random_state=random_state)
+    else:
+        img = img
+
+    return img
+
+
+
+import math
+import warnings
+from scipy.ndimage import _ni_support, _nd_image
+from scipy.misc import doccer
+
+def map_coordinates(input, coordinates, output=None, order=3,
+mode='constant', cval=0.0, prefilter=True):
+    input = input[0,:,:]
+    if order < 0 or order > 5:
+        raise RuntimeError('spline order not supported')
+    input = np.asarray(input)
+    if np.iscomplexobj(input):
+        raise TypeError('Complex type not supported')
+    coordinates = np.asarray(coordinates)
+    if np.iscomplexobj(coordinates):
+        raise TypeError('Complex type not supported')
+    output_shape = coordinates.shape[1:]
+    if input.ndim < 1 or len(output_shape) < 1:
+        raise RuntimeError('input and output rank must be > 0')
+    if coordinates.shape[0] != input.ndim:
+        raise RuntimeError('invalid shape for coordinate array')
+    mode = _ni_support._extend_mode_to_code(mode)
+    if prefilter and order > 1:
+        filtered = spline_filter(input, order, output=np.float64)
+    else:
+        filtered = input
+    output = _ni_support._get_output(output, input,
+                                     shape=output_shape)
+    _nd_image.geometric_transform(filtered, None, coordinates, None, None,
+                                  output, order, mode, cval, None, None)
+
+    output = np.expand_dims(output, axis=0)
+
+    return output
 
 #----------------------------------------------------------------------------
 
