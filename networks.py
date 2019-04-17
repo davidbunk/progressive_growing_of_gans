@@ -70,6 +70,7 @@ def sync_batch_norm(inputs, decay=0.999,
                     epsilon=0.001,
                     activation_fn=None,
                     updates_collections=tf.GraphKeys.UPDATE_OPS,
+                    #updates_collections=None,
                     is_training=True,
                     reuse=tf.AUTO_REUSE,
                     variables_collections=None,
@@ -87,19 +88,19 @@ def sync_batch_norm(inputs, decay=0.999,
             'BatchNorm',
             reuse=reuse):
 
-        gamma = tf.get_variable(name='gamma', shape=[1, num_outputs, 1, 1], dtype=tf.float32,
+        gamma = tf.get_variable(name='gamma', shape=[num_outputs], dtype=tf.float32,
                                 initializer=tf.constant_initializer(1.0), trainable=trainable,
                                 collections=variables_collections)
 
-        beta  = tf.get_variable(name='beta', shape=[1, num_outputs, 1, 1], dtype=tf.float32,
+        beta  = tf.get_variable(name='beta', shape=[num_outputs], dtype=tf.float32,
                                 initializer=tf.constant_initializer(0.0), trainable=trainable,
                                 collections=variables_collections)
 
-        moving_mean = tf.get_variable(name='moving_mean', shape=[1, num_outputs, 1, 1], dtype=tf.float32,
+        moving_mean = tf.get_variable(name='moving_mean', shape=[num_outputs], dtype=tf.float32,
                                       initializer=tf.constant_initializer(0.0), trainable=False,
                                       collections=variables_collections)
 
-        moving_var = tf.get_variable(name='moving_variance', shape=[1, num_outputs, 1, 1], dtype=tf.float32,
+        moving_var = tf.get_variable(name='moving_variance', shape=[num_outputs], dtype=tf.float32,
                                      initializer=tf.constant_initializer(1.0), trainable=False,
                                      collections=variables_collections)
 
@@ -108,8 +109,8 @@ def sync_batch_norm(inputs, decay=0.999,
                 mean, var = tf.nn.moments(inputs, red_axises)
             else:
                 shared_name = tf.get_variable_scope().name
-                batch_mean        = tf.reduce_mean(inputs, axis=red_axises, keep_dims=True)
-                batch_mean_square = tf.reduce_mean(tf.square(inputs), axis=red_axises, keep_dims=True)
+                batch_mean        = tf.reduce_mean(inputs, axis=red_axises, keep_dims=False)
+                batch_mean_square = tf.reduce_mean(tf.square(inputs), axis=red_axises, keep_dims=False)
                 batch_mean        = gen_nccl_ops.nccl_all_reduce(
                     input=batch_mean,
                     reduction='sum',
@@ -123,9 +124,10 @@ def sync_batch_norm(inputs, decay=0.999,
                 mean              = batch_mean
                 var               = batch_mean_square - tf.square(batch_mean)
 
-            outputs = tf.nn.batch_normalization(inputs, mean, var, beta, gamma, epsilon)
+            #outputs = tf.nn.batch_normalization(inputs, mean, var, beta, gamma, epsilon)
 
-            if int(outputs.device[-1])== 0:
+            #if int(outputs.device[-1])== 0:
+            if True:
                 update_moving_mean_op = tf.assign(moving_mean, moving_mean * decay + mean * (1 - decay))
                 update_moving_var_op  = tf.assign(moving_var,  moving_var  * decay + var  * (1 - decay))
                 add_model_variable(moving_mean)
@@ -137,12 +139,14 @@ def sync_batch_norm(inputs, decay=0.999,
                 else:
                     tf.add_to_collections(updates_collections, update_moving_mean_op)
                     tf.add_to_collections(updates_collections, update_moving_var_op)
-                    outputs = tf.identity(outputs)
+                    #outputs = tf.identity(outputs)
             else:
-                outputs = tf.identity(outputs)
+                pass
+                #outputs = tf.identity(outputs)
 
         else:
-            outputs,_,_ = tf.nn.fused_batch_norm(inputs, gamma, beta, mean=moving_mean, variance=moving_var, epsilon=epsilon, is_training=False)
+            pass
+        outputs,_,_ = tf.nn.fused_batch_norm(inputs, gamma, beta, mean=moving_mean, variance=moving_var, epsilon=epsilon, data_format='NCHW', is_training=False)
 
         if activation_fn is not None:
             outputs = activation_fn(outputs)

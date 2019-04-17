@@ -91,8 +91,8 @@ class TrainingSchedule:
         cur_nimg,
         training_set,
         lod_initial_resolution  = 4,        # Image resolution used at the beginning.
-        lod_training_kimg       = 20,      # Thousands of real images to show before doubling the resolution.
-        lod_transition_kimg     = 20,      # Thousands of real images to show when fading in new layers.
+        lod_training_kimg       = 600,      # Thousands of real images to show before doubling the resolution.
+        lod_transition_kimg     = 600,      # Thousands of real images to show when fading in new layers.
         minibatch_base          = 1,       # Maximum minibatch size, divided evenly among GPUs.
         minibatch_dict          = {},       # Resolution-specific overrides.
         max_minibatch_per_gpu   = {},       # Resolution-specific maximum minibatch size per GPU.
@@ -224,8 +224,6 @@ def train_progressive_gan(
             reals_2_gpu = process_reals(reals_2_split[gpu], lod_in, mirror_augment, training_set_2.dynamic_range, drange_net)
             labels_2_gpu = labels_2_split[gpu]
 
-            update_ops = tf.get_collection(tf.GraphKeys.UPDATE_OPS)
-
             # Phase 1
             with tf.name_scope('G_loss'), tf.control_dependencies(lod_assign_ops):
                 G_loss = tfutil.call_func_by_name(G=G_gpu, D=D_gpu, opt=G_opt, training_set=training_set, minibatch_size=minibatch_split, **config.G_loss)
@@ -243,8 +241,7 @@ def train_progressive_gan(
             D_opt.register_gradients(tf.reduce_mean(D_loss), D_gpu.trainables)
 
             # Phase 2
-            with tf.control_dependencies(update_ops):
-                G_2_opt.register_gradients(tf.reduce_mean(G_2_loss), G_2_gpu.trainables)
+            G_2_opt.register_gradients(tf.reduce_mean(G_2_loss), G_2_gpu.trainables)
             D_2_opt.register_gradients(tf.reduce_mean(D_2_loss), D_2_gpu.trainables)
 
     # Phase 1
@@ -252,6 +249,8 @@ def train_progressive_gan(
     D_train_op = D_opt.apply_updates()
 
     # Phase 2
+    #update_ops = tf.get_collection(tf.GraphKeys.UPDATE_OPS)
+    #with tf.control_dependencies(update_ops):
     G_2_train_op = G_2_opt.apply_updates()
     D_2_train_op = D_2_opt.apply_updates()
 
