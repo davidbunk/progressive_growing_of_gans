@@ -9,9 +9,9 @@ import numpy as np
 import tensorflow as tf
 import tensorflow.contrib.layers as tcl
 from tensorflow.python.ops.nccl_ops import gen_nccl_ops
+from tensorflow.python.training import moving_averages
 from tensorflow.contrib.framework import add_model_variable
 from tensorflow.image import ResizeMethod
-from tensorpack.models.batch_norm import BatchNorm
 
 # NOTE: Do not import any application-specific modules here!
 
@@ -69,8 +69,8 @@ def apply_bias(x):
 def sync_batch_norm(inputs, decay=0.999,
                     epsilon=0.001,
                     activation_fn=None,
-                    updates_collections=tf.GraphKeys.UPDATE_OPS,
-                    #updates_collections=None,
+                    #updates_collections=tf.GraphKeys.UPDATE_OPS,
+                    updates_collections=None,
                     is_training=True,
                     reuse=tf.AUTO_REUSE,
                     variables_collections=None,
@@ -104,6 +104,14 @@ def sync_batch_norm(inputs, decay=0.999,
                                      initializer=tf.constant_initializer(1.0), trainable=False,
                                      collections=variables_collections)
 
+        moving_mean2 = tf.get_variable(name='moving_mean2', shape=[num_outputs], dtype=tf.float32,
+                                      initializer=tf.constant_initializer(0.0), trainable=False,
+                                      collections=variables_collections)
+
+        moving_var2 = tf.get_variable(name='moving_variance2', shape=[num_outputs], dtype=tf.float32,
+                                     initializer=tf.constant_initializer(1.0), trainable=False,
+                                     collections=variables_collections)
+
         if is_training and trainable:
             if num_dev == 1:
                 mean, var = tf.nn.moments(inputs, red_axises)
@@ -126,29 +134,37 @@ def sync_batch_norm(inputs, decay=0.999,
 
             #outputs = tf.nn.batch_normalization(inputs, mean, var, beta, gamma, epsilon)
 
-            #if int(outputs.device[-1])== 0:
-            if True:
-                update_moving_mean_op = tf.assign(moving_mean, moving_mean * decay + mean * (1 - decay))
-                update_moving_var_op  = tf.assign(moving_var,  moving_var  * decay + var  * (1 - decay))
+            ##### MAKE NICE AND DOUBLE CHECK
+
+            if 1:
+                #update_moving_mean_op = tf.assign(moving_mean, moving_mean * decay + mean * (1 - decay))
+                #update_moving_var_op  = tf.assign(moving_var,  moving_var  * decay + var  * (1 - decay))
+                update_moving_mean_op = moving_averages.assign_moving_average(moving_mean, mean, decay, zero_debias=False, name='mean_op')
+                update_moving_var_op = moving_averages.assign_moving_average(moving_var, var, decay, zero_debias=False, name='var_op')
+
+                update_moving_mean_op2 = moving_averages.assign_moving_average(moving_mean2, mean, 0, zero_debias=False, name='mean_op2')
+                update_moving_var_op2 = moving_averages.assign_moving_average(moving_var2, var, 0, zero_debias=False, name='var_op2')
+
                 add_model_variable(moving_mean)
                 add_model_variable(moving_var)
 
                 if updates_collections is None:
                     with tf.control_dependencies([update_moving_mean_op, update_moving_var_op]):
-                        outputs = tf.identity(outputs)
+                        outputs = tf.identity(inputs)
+                    with tf.control_dependencies([update_moving_mean_op2, update_moving_var_op2]):
+                        outputs = tf.identity(inputs)
                 else:
                     tf.add_to_collections(updates_collections, update_moving_mean_op)
                     tf.add_to_collections(updates_collections, update_moving_var_op)
-                    #outputs = tf.identity(outputs)
+                    outputs = tf.identity(outputs)
             else:
-                pass
-                #outputs = tf.identity(outputs)
-
+                outputs = tf.identity(outputs)
         else:
-            pass
-        outputs,_,_ = tf.nn.fused_batch_norm(inputs, gamma, beta, mean=moving_mean, variance=moving_var, epsilon=epsilon, data_format='NCHW', is_training=False)
+            outputs,_,_ = tf.nn.fused_batch_norm(inputs, gamma, beta, mean=moving_mean, variance=moving_var, epsilon=epsilon, data_format='NCHW', is_training=False)
 
-        if activation_fn is not None:
+        outputs,_,_ = tf.nn.fused_batch_norm(inputs, gamma, beta, mean=moving_mean2, variance=moving_var2, epsilon=epsilon, data_format='NCHW', is_training=False)
+
+    if activation_fn is not None:
             outputs = activation_fn(outputs)
 
     return outputs
