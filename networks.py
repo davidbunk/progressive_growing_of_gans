@@ -307,6 +307,8 @@ def G_paper(
     structure           = None,         # 'linear' = human-readable, 'recursive' = efficient, None = select automatically.
     is_template_graph   = False,        # True = template graph constructed by the Network class, False = actual evaluation.
     **kwargs):                          # Ignore unrecognized keyword args.
+
+    structure = 'recursive'
     
     resolution_log2 = int(np.log2(resolution))
     assert resolution == 2**resolution_log2 and resolution >= 4
@@ -377,6 +379,148 @@ def G_paper(
     return images_out
 
 
+def G_phase2_playground(
+        latents_in,                         # First input: Latent vectors [minibatch, latent_size].
+        labels_in,                          # Second input: Labels [minibatch, label_size].
+        mask,                                # Third input: Masks
+        num_channels        = 1,            # Number of output color channels. Overridden based on dataset.
+        resolution          = 32,           # Output resolution. Overridden based on dataset.
+        label_size          = 0,            # Dimensionality of the labels, 0 if no labels. Overridden based on dataset.
+        fmap_base           = 8192,         # Overall multiplier for the number of feature maps.
+        fmap_decay          = 1.0,          # log2 feature map reduction when doubling the resolution.
+        fmap_max            = 512,          # Maximum number of feature maps in any layer.
+        latent_size         = None,         # Dimensionality of the latent vectors. None = min(fmap_base, fmap_max).
+        normalize_latents   = True,         # Normalize latent vectors before feeding them to the network?
+        use_wscale          = True,         # Enable equalized learning rate?
+        use_pixelnorm       = True,         # Enable pixelwise feature vector normalization?
+        pixelnorm_epsilon   = 1e-8,         # Constant epsilon for pixelwise feature vector normalization.
+        use_leakyrelu       = True,         # True = leaky ReLU, False = ReLU.
+        dtype               = 'float32',    # Data type to use for activations and outputs.
+        fused_scale         = True,         # True = use fused upscale2d + conv2d, False = separate upscale2d layers.
+        structure           = None,         # 'linear' = human-readable, 'recursive' = efficient, None = select automatically.
+        is_template_graph   = False,        # True = template graph constructed by the Network class, False = actual evaluation.
+        **kwargs):                          # Ignore unrecognized keyword args.
+
+    resolution_log2 = int(np.log2(resolution))
+    assert resolution == 2**resolution_log2 and resolution >= 4
+    def nf(stage): return min(int(fmap_base / (2.0 ** (stage * fmap_decay))), fmap_max)
+    def PN(x): return pixel_norm(x, epsilon=pixelnorm_epsilon) if use_pixelnorm else x
+    if latent_size is None: latent_size = nf(0)
+    if structure is None: structure = 'linear' if is_template_graph else 'recursive'
+    act = leaky_relu if use_leakyrelu else tf.nn.relu
+
+    latents_in.set_shape([None, latent_size])
+    labels_in.set_shape([None, label_size])
+    mask.set_shape([None, 1, None, None])
+
+    # COMMENT TOOK LABELS OUT
+    #combo_in = tf.cast(tf.concat([latents_in, labels_in], axis=1), dtype)
+    combo_in = latents_in
+    lod_in = tf.cast(tf.get_variable('lod', initializer=np.float32(0.0), trainable=False), dtype)
+
+    def resize_mask(mask, res):
+        #mask = downscale2d(mask, res)
+        for idx in range(res):
+            mask = mask[:, :, 0::2, 0::2]
+        return mask
+
+    def spade(x, label, res, first=False):
+        if first:
+            filters = nf(res-2)
+        else:
+            filters = nf(res-1)
+
+        #x = sync_batch_norm(x)
+        tf.contrib.layers.batch_norm(x, data_format='NCHW')
+
+        # MAKE GENERALISED CHECK !!!!!!!!
+        #label = resize_mask(label, x.get_shape()[2:])
+        #label = resize_mask(label, int(2**(11-res)))
+        label = resize_mask(label, 10-res)
+
+        with tf.variable_scope('mainconv', reuse=tf.AUTO_REUSE):
+            label = tf.contrib.layers.conv2d(label, 128, 3, data_format='NCHW')
+
+        #with tf.variable_scope('mulconv', reuse=tf.AUTO_REUSE):
+            label_mul = tf.contrib.layers.conv2d(label, filters, 3, data_format='NCHW', activation_fn=None, weights_initializer=tf.initializers.random_uniform(minval=-1, maxval=1))
+
+        #with tf.variable_scope('addconv', reuse=tf.AUTO_REUSE):
+            label_add = tf.contrib.layers.conv2d(label, filters, 3, data_format='NCHW', activation_fn=None)
+
+        x = tf.multiply(x, label_mul)
+        x = tf.add(x, label_add)
+
+        #x = tf.concat([x, label], axis=1)
+
+        return x
+
+    def spade_block(x, label, res, first=False):
+        x = spade(x, label, res, first=first)
+        x = tf.nn.relu(x)
+
+        filters = nf(res-1)
+
+        with tf.variable_scope('spdconv', reuse=tf.AUTO_REUSE):
+            x = tf.contrib.layers.conv2d(x, filters, 3, data_format='NCHW', activation_fn=tf.nn.leaky_relu)
+
+        return x
+
+    def block(x, label, res): # res = 2..resolution_log2
+        with tf.variable_scope('%dx%d' % (2**res, 2**res)):
+            if res == 2: # 4x4
+                if normalize_latents: x = pixel_norm(x, epsilon=pixelnorm_epsilon)
+                with tf.variable_scope('Dense'):
+                    x = dense(x, fmaps=nf(res-1)*16, gain=np.sqrt(2)/4, use_wscale=use_wscale) # override gain to match the original Theano implementation
+                    x = tf.reshape(x, [-1, nf(res-1), 4, 4])
+                    x = PN(act(apply_bias(x)))
+                with tf.variable_scope('Conv'):
+                    x = PN(act(apply_bias(conv2d(x, fmaps=nf(res-1), kernel=3, use_wscale=use_wscale))))
+            else: # 8x8 and up
+                x = upscale2d(x, 2)
+
+                # with tf.variable_scope('spade_res_1'):
+                #     residual = spade_block(x, label, res, first=True)
+                with tf.variable_scope('spade_res_2'):
+                    x = spade_block(x, label, res, first=True)
+                # with tf.variable_scope('spade_res_3'):
+                #     x = spade_block(x, label, res)
+
+                #x = tf.add(x, residual)
+
+            return x
+
+    def torgb(x, res): # res = 2..resolution_log2
+        lod = resolution_log2 - res
+        with tf.variable_scope('ToRGB_lod%d' % lod):
+            return apply_bias(conv2d(x, fmaps=num_channels, kernel=1, gain=1, use_wscale=use_wscale))
+
+    # Linear structure: simple but inefficient.
+    if structure == 'linear':
+        x = block(combo_in, mask, 2)
+        images_out = torgb(x, 2)
+        for res in range(3, resolution_log2 + 1):
+            lod = resolution_log2 - res
+            x = block(x, mask, res)
+            img = torgb(x, res)
+            images_out = upscale2d(images_out)
+            with tf.variable_scope('Grow_lod%d' % lod):
+                images_out = lerp_clip(img, images_out, lod_in - lod)
+
+    # Recursive structure: complex but efficient.
+    if structure == 'recursive':
+        def grow(x, res, lod):
+            y = block(x, mask, res)
+            img = lambda: upscale2d(torgb(y, res), 2**lod)
+            if res > 2: img = cset(img, (lod_in > lod), lambda: upscale2d(lerp(torgb(y, res), upscale2d(torgb(x, res - 1)), lod_in - lod), 2**lod))
+            if lod > 0: img = cset(img, (lod_in < lod), lambda: grow(y, res + 1, lod - 1))
+            return img()
+        images_out = grow(combo_in, 2, resolution_log2 - 2)
+
+    assert images_out.dtype == tf.as_dtype(dtype)
+    images_out = tf.nn.tanh(images_out, name='images_out')
+    return images_out
+
+
 def G_phase2(
         latents_in,                         # First input: Latent vectors [minibatch, latent_size].
         labels_in,                          # Second input: Labels [minibatch, label_size].
@@ -429,48 +573,59 @@ def G_phase2(
             filters = nf(res-1)
 
         x = sync_batch_norm(x)
+        #tf.contrib.layers.batch_norm(x, data_format='NCHW')
 
         # MAKE GENERALISED CHECK !!!!!!!!
         #label = resize_mask(label, x.get_shape()[2:])
         #label = resize_mask(label, int(2**(11-res)))
-        label = resize_mask(label, 11-res)
+        label = resize_mask(label, 10-res)
 
-        with tf.variable_scope('mainconv', reuse=tf.AUTO_REUSE):
-            w = tf.get_variable("kernel", shape=[3, 3, label.get_shape()[1], 128])
-            b = tf.get_variable("bias", [128], initializer=tf.constant_initializer(0.0))
-            label = tf.nn.conv2d(input=label, filter=spectral_norm(w), strides=[1, 1, 1, 1], padding='SAME', data_format='NCHW')
-            label = tf.nn.bias_add(label, b, data_format='NCHW')
-            label = tf.nn.relu(label)
+        # with tf.variable_scope('mainconv', reuse=tf.AUTO_REUSE):
+        #     w = tf.get_variable("kernel", shape=[3, 3, label.get_shape()[1], 128], initializer=tf.contrib.layers.xavier_initializer(uniform=False))
+        #     b = tf.get_variable("bias", [128], initializer=tf.constant_initializer(0.0))
+        #     label = tf.nn.conv2d(input=label, filter=spectral_norm(w), strides=[1, 1, 1, 1], padding='SAME', data_format='NCHW')
+        #     label = tf.nn.bias_add(label, b, data_format='NCHW')
+        #     label = tf.nn.relu(label)
+        #
+        # with tf.variable_scope('mulconv', reuse=tf.AUTO_REUSE):
+        #     w = tf.get_variable("kernel", shape=[3, 3, 128, filters])
+        #     b = tf.get_variable("bias", [filters], initializer=tf.constant_initializer(0.0))
+        #     label_mul = tf.nn.conv2d(input=label, filter=spectral_norm(w), strides=[1, 1, 1, 1], padding='SAME', data_format='NCHW')
+        #     label_mul = tf.nn.bias_add(label_mul, b, data_format='NCHW')
+        #
+        # with tf.variable_scope('addconv', reuse=tf.AUTO_REUSE):
+        #     w = tf.get_variable("kernel", shape=[3, 3, 128, filters])
+        #     b = tf.get_variable("bias", [filters], initializer=tf.constant_initializer(0.0))
+        #     label_add = tf.nn.conv2d(input=label, filter=spectral_norm(w), strides=[1, 1, 1, 1], padding='SAME', data_format='NCHW')
+        #     label_add = tf.nn.bias_add(label_add, b, data_format='NCHW')
 
-        with tf.variable_scope('mulconv', reuse=tf.AUTO_REUSE):
-            w = tf.get_variable("kernel", shape=[3, 3, 128, filters])
-            b = tf.get_variable("bias", [filters], initializer=tf.constant_initializer(0.0))
-            label_mul = tf.nn.conv2d(input=label, filter=spectral_norm(w), strides=[1, 1, 1, 1], padding='SAME', data_format='NCHW')
-            label_mul = tf.nn.bias_add(label_mul, b, data_format='NCHW')
+        label = tf.contrib.layers.conv2d(label, 128, 3, data_format='NCHW', activation_fn=tf.nn.leaky_relu)
+        label_mul = tf.contrib.layers.conv2d(label, filters, 3, data_format='NCHW', activation_fn=None)
+        label_add = tf.contrib.layers.conv2d(label, filters, 3, data_format='NCHW', activation_fn=None)
 
-        with tf.variable_scope('addconv', reuse=tf.AUTO_REUSE):
-            w = tf.get_variable("kernel", shape=[3, 3, 128, filters])
-            b = tf.get_variable("bias", [filters], initializer=tf.constant_initializer(0.0))
-            label_add = tf.nn.conv2d(input=label, filter=spectral_norm(w), strides=[1, 1, 1, 1], padding='SAME', data_format='NCHW')
-            label_add = tf.nn.bias_add(label_add, b, data_format='NCHW')
-
+        label_mul = label_mul + 1
         x = tf.multiply(x, label_mul)
         x = tf.add(x, label_add)
 
         return x
 
-    def spade_block(x, label, res, first=False):
+    def spade_block(x, label, res, skip=False,first=False):
         x = spade(x, label, res, first=first)
-        x = tf.nn.relu(x)
+        x = tf.nn.leaky_relu(x)
 
         filters = nf(res-1)
 
-        with tf.variable_scope('spdconv', reuse=tf.AUTO_REUSE):
-            w = tf.get_variable("kernel", shape=[3, 3, x.get_shape()[1], filters])
-            b = tf.get_variable("bias", [filters], initializer=tf.constant_initializer(0.0))
+        # with tf.variable_scope('spdconv', reuse=tf.AUTO_REUSE):
+        #     w = tf.get_variable("kernel", shape=[3, 3, x.get_shape()[1], filters])
+        #     b = tf.get_variable("bias", [filters], initializer=tf.constant_initializer(0.0))
+        #
+        #     x = tf.nn.conv2d(input=x, filter=spectral_norm(w), strides=[1, 1, 1, 1], padding='SAME', data_format='NCHW')
+        #     x = tf.nn.bias_add(x, b, data_format='NCHW')
 
-            x = tf.nn.conv2d(input=x, filter=spectral_norm(w), strides=[1, 1, 1, 1], padding='SAME', data_format='NCHW')
-            x = tf.nn.bias_add(x, b, data_format='NCHW')
+        if not skip:
+            x = tf.contrib.layers.conv2d(x, filters, 3, data_format='NCHW', activation_fn=tf.nn.leaky_relu)
+        else:
+            x = tf.contrib.layers.conv2d(x, filters, 1, data_format='NCHW', biases_initializer=None, activation_fn=None)
 
         return x
 
@@ -485,16 +640,16 @@ def G_phase2(
                 with tf.variable_scope('Conv'):
                     x = PN(act(apply_bias(conv2d(x, fmaps=nf(res-1), kernel=3, use_wscale=use_wscale))))
             else: # 8x8 and up
+                x = upscale2d(x, 2)
+
                 with tf.variable_scope('spade_res_1'):
-                    residual = spade_block(x, label, res, first=True)
+                    residual = spade_block(x, label, res, skip=True, first=True)
                 with tf.variable_scope('spade_res_2'):
                     x = spade_block(x, label, res, first=True)
                 with tf.variable_scope('spade_res_3'):
                     x = spade_block(x, label, res)
 
                 x = tf.add(x, residual)
-
-                x = upscale2d(x, 2)
 
             return x
 
