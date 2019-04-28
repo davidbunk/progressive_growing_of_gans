@@ -93,10 +93,10 @@ def D_wgangp_acgan(G, D, opt, training_set, minibatch_size, reals, labels,
 def G_2_wgan_acgan(G, D, opt, training_set, minibatch_size, G_old, training_set_old, reallbl,
                  cond_weight = 1.0): # Weight of the conditioning term.
 
-    latents_old = tf.random_normal([minibatch_size] + G_old.input_shapes[0][1:])
-    labels_old = training_set_old.get_random_labels_tf(minibatch_size)
-
-    mask = G_old.get_output_for(latents_old, labels_old, is_training=False)
+    # latents_old = tf.random_normal([minibatch_size] + G_old.input_shapes[0][1:])
+    # labels_old = training_set_old.get_random_labels_tf(minibatch_size)
+    #
+    # mask = G_old.get_output_for(latents_old, labels_old, is_training=False)
 
     latents = tf.random_normal([minibatch_size] + G.input_shapes[0][1:])
     labels = training_set.get_random_labels_tf(minibatch_size)
@@ -121,32 +121,32 @@ def D_2_wgangp_acgan(G, D, opt, training_set, minibatch_size, reals, labels, G_o
 
     latents = tf.random_normal([minibatch_size] + G.input_shapes[0][1:])
 
-    latents_old = tf.random_normal([minibatch_size] + G_old.input_shapes[0][1:])
-    labels_old = training_set_old.get_random_labels_tf(minibatch_size)
-    mask = G_old.get_output_for(latents_old, labels_old, is_training=False)
+    # latents_old = tf.random_normal([minibatch_size] + G_old.input_shapes[0][1:])
+    # labels_old = training_set_old.get_random_labels_tf(minibatch_size)
+    # mask = G_old.get_output_for(latents_old, labels_old, is_training=False)
 
-    fake_images_out = G.get_output_for(latents, labels, reals, is_training=True)
+    fake_images_out = G.get_output_for(latents, labels, reallbl, is_training=True)
     real_scores_out, real_labels_out = fp32(D.get_output_for(reals, is_training=True))
     fake_scores_out, fake_labels_out = fp32(D.get_output_for(fake_images_out, is_training=True))
     real_scores_out = tfutil.autosummary('Loss2/real_scores', real_scores_out)
     fake_scores_out = tfutil.autosummary('Loss2/fake_scores', fake_scores_out)
-    loss = tf.nn.relu(1.0 + fake_scores_out) - tf.nn.relu(1.0 - real_scores_out)
+    loss = fake_scores_out - real_scores_out
 
-    # with tf.name_scope('GradientPenalty2'):
-    #     mixing_factors = tf.random_uniform([minibatch_size, 1, 1, 1], 0.0, 1.0, dtype=fake_images_out.dtype)
-    #     mixed_images_out = tfutil.lerp(tf.cast(reals, fake_images_out.dtype), fake_images_out, mixing_factors)
-    #     mixed_scores_out, mixed_labels_out = fp32(D.get_output_for(mixed_images_out, is_training=True))
-    #     mixed_scores_out = tfutil.autosummary('Loss2/mixed_scores', mixed_scores_out)
-    #     mixed_loss = opt.apply_loss_scaling(tf.reduce_sum(mixed_scores_out))
-    #     mixed_grads = opt.undo_loss_scaling(fp32(tf.gradients(mixed_loss, [mixed_images_out])[0]))
-    #     mixed_norms = tf.sqrt(tf.reduce_sum(tf.square(mixed_grads), axis=[1,2,3]))
-    #     mixed_norms = tfutil.autosummary('Loss2/mixed_norms', mixed_norms)
-    #     gradient_penalty = tf.square(mixed_norms - wgan_target)
-    # loss += gradient_penalty * (wgan_lambda / (wgan_target**2))
-    #
-    # with tf.name_scope('EpsilonPenalty2'):
-    #     epsilon_penalty = tfutil.autosummary('Loss2/epsilon_penalty', tf.square(real_scores_out))
-    # loss += epsilon_penalty * wgan_epsilon
+    with tf.name_scope('GradientPenalty2'):
+        mixing_factors = tf.random_uniform([minibatch_size, 1, 1, 1], 0.0, 1.0, dtype=fake_images_out.dtype)
+        mixed_images_out = tfutil.lerp(tf.cast(reals, fake_images_out.dtype), fake_images_out, mixing_factors)
+        mixed_scores_out, mixed_labels_out = fp32(D.get_output_for(mixed_images_out, is_training=True))
+        mixed_scores_out = tfutil.autosummary('Loss2/mixed_scores', mixed_scores_out)
+        mixed_loss = opt.apply_loss_scaling(tf.reduce_sum(mixed_scores_out))
+        mixed_grads = opt.undo_loss_scaling(fp32(tf.gradients(mixed_loss, [mixed_images_out])[0]))
+        mixed_norms = tf.sqrt(tf.reduce_sum(tf.square(mixed_grads), axis=[1,2,3]))
+        mixed_norms = tfutil.autosummary('Loss2/mixed_norms', mixed_norms)
+        gradient_penalty = tf.square(mixed_norms - wgan_target)
+    loss += gradient_penalty * (wgan_lambda / (wgan_target**2))
+
+    with tf.name_scope('EpsilonPenalty2'):
+        epsilon_penalty = tfutil.autosummary('Loss2/epsilon_penalty', tf.square(real_scores_out))
+    loss += epsilon_penalty * wgan_epsilon
 
     # if D.output_shapes[1][1] > 0:
     #     with tf.name_scope('LabelPenalty2'):
