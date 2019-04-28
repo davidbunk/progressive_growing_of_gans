@@ -16,6 +16,8 @@ import dataset
 import misc
 import os
 
+from skimage.exposure import rescale_intensity
+
 os.environ['CUDA_VISIBLE_DEVICES'] = '0, 1'
 
 #----------------------------------------------------------------------------
@@ -175,7 +177,7 @@ def train_progressive_gan(
             Gs_2 = G_2.clone('Gs_2')
 
         Gs_update_op = Gs.setup_as_moving_average_of(G, beta=G_smoothing)
-        Gs_2_update_op = Gs_2.setup_as_moving_average_of(G, beta=G_smoothing)
+        Gs_2_update_op = Gs_2.setup_as_moving_average_of(G_2, beta=G_smoothing)
 
     print('Phase 1 layers:')
     G.print_layers(); D.print_layers()
@@ -218,7 +220,7 @@ def train_progressive_gan(
             # Phase 1 processing.
             lod_assign_ops = [tf.assign(G_gpu.find_var('lod'), lod_in), tf.assign(D_gpu.find_var('lod'), lod_in)]
             reals_gpu = process_reals(reals_split[gpu], lod_in, mirror_augment, training_set.dynamic_range, drange_net)
-            reals_gpu_spade = process_reals(reals_split[gpu], lod_in, mirror_augment, training_set.dynamic_range, [0, 255])
+            reals_gpu_spade = process_reals(reals_split[gpu], lod_in, mirror_augment, training_set.dynamic_range, [1, 3])
             labels_gpu = labels_split[gpu]
 
             # Phase 2 processing.
@@ -346,7 +348,7 @@ def train_progressive_gan(
                 misc.format_time(tfutil.autosummary('Timing/total_sec', total_time)),
                 tfutil.autosummary('Timing/sec_per_tick', tick_time),
                 tfutil.autosummary('Timing/sec_per_kimg', tick_time / tick_kimg),
-                tfutil.autosummary('Timing/maintenance_sec', maintenance_time)))
+                tfutil.autosummary('Timing/maintenance_sec', bmaintenance_time)))
             tfutil.autosummary('Timing/total_hours', total_time / (60.0 * 60.0))
             tfutil.autosummary('Timing/total_days', total_time / (24.0 * 60.0 * 60.0))
             tfutil.save_summaries(summary_log, cur_nimg)
@@ -356,7 +358,7 @@ def train_progressive_gan(
                 # Phase 1
                 grid_fakes = Gs.run(grid_latents, grid_labels, minibatch_size=sched.minibatch//config.num_gpus)
                 misc.save_image_grid(grid_fakes, os.path.join(result_subdir, 'fake_labels%06d.png' % (cur_nimg // 1000)), drange=drange_net, grid_size=grid_size)
-                # Phase 2
+                grid_fakes = rescale_intensity(grid_fakes, out_range=(1, 3))
                 grid_fakes_2 = Gs_2.run(grid_latents_2, grid_labels_2, grid_fakes, minibatch_size=sched_2.minibatch//config.num_gpus)
                 misc.save_image_grid(grid_fakes_2, os.path.join(result_subdir, 'fake_images%06d.png' % (cur_nimg // 1000)), drange=drange_net, grid_size=grid_size_2)
             if cur_tick % network_snapshot_ticks == 0 or done:
