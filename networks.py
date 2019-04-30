@@ -439,21 +439,24 @@ def G_phase2(
         #label = resize_mask(label, int(2**(11-res)))
         label = resize_mask(label, 10-res)
 
-        w = tf.get_variable("kernel", shape=[3, 3, label.get_shape()[1], 128])
-        b = tf.get_variable("bias", [128], initializer=tf.constant_initializer(0.0))
-        label = tf.nn.conv2d(input=label, filter=spectral_norm(w), strides=[1, 1, 1, 1], padding='SAME', data_format='NCHW')
-        label = tf.nn.bias_add(label, b, data_format='NCHW')
-        label = tf.nn.leaky_relu(label)
+        with tf.variable_scope('enc_conv'):
+            w = tf.get_variable("kernel", shape=[3, 3, label.get_shape()[1], 128])
+            b = tf.get_variable("bias", [128], initializer=tf.constant_initializer(0.0))
+            label = tf.nn.conv2d(input=label, filter=spectral_norm(w), strides=[1, 1, 1, 1], padding='SAME', data_format='NCHW')
+            label = tf.nn.bias_add(label, b, data_format='NCHW')
+            label = tf.nn.leaky_relu(label)
 
-        w = tf.get_variable("kernel", shape=[3, 3, 128, filters])
-        b = tf.get_variable("bias", [filters], initializer=tf.constant_initializer(0.0))
-        label_mul = tf.nn.conv2d(input=label, filter=spectral_norm(w), strides=[1, 1, 1, 1], padding='SAME', data_format='NCHW')
-        label_mul = tf.nn.bias_add(label_mul, b, data_format='NCHW')
+        with tf.variable_scope('mul_conv'):
+            w = tf.get_variable("kernel", shape=[3, 3, 128, filters])
+            b = tf.get_variable("bias", [filters], initializer=tf.constant_initializer(0.0))
+            label_mul = tf.nn.conv2d(input=label, filter=spectral_norm(w), strides=[1, 1, 1, 1], padding='SAME', data_format='NCHW')
+            label_mul = tf.nn.bias_add(label_mul, b, data_format='NCHW')
 
-        w = tf.get_variable("kernel", shape=[3, 3, 128, filters])
-        b = tf.get_variable("bias", [filters], initializer=tf.constant_initializer(0.0))
-        label_add = tf.nn.conv2d(input=label, filter=spectral_norm(w), strides=[1, 1, 1, 1], padding='SAME', data_format='NCHW')
-        label_add = tf.nn.bias_add(label_add, b, data_format='NCHW')
+        with tf.variable_scope('add_conv'):
+            w = tf.get_variable("kernel", shape=[3, 3, 128, filters])
+            b = tf.get_variable("bias", [filters], initializer=tf.constant_initializer(0.0))
+            label_add = tf.nn.conv2d(input=label, filter=spectral_norm(w), strides=[1, 1, 1, 1], padding='SAME', data_format='NCHW')
+            label_add = tf.nn.bias_add(label_add, b, data_format='NCHW')
 
         # label = tf.contrib.layers.conv2d(label, 128, 3, data_format='NCHW', activation_fn=tf.nn.leaky_relu)
         # label_mul = tf.contrib.layers.conv2d(label, filters, 3, data_format='NCHW', activation_fn=None)
@@ -466,21 +469,23 @@ def G_phase2(
         return x
 
     def spade_block(x, label, res, skip=False,first=False):
-        x = spade(x, label, res, first=first)
-        x = tf.nn.leaky_relu(x)
+        with tf.variable_scope('label_convs'):
+            x = spade(x, label, res, first=first)
+            x = tf.nn.leaky_relu(x)
 
         filters = nf(res-1)
 
-        if not skip:
-            w = tf.get_variable("kernel", shape=[3, 3, x.get_shape()[1], filters])
-            b = tf.get_variable("bias", [filters], initializer=tf.constant_initializer(0.0))
+        with tf.variable_scope('img_conv'):
+            if not skip:
+                w = tf.get_variable("kernel", shape=[3, 3, x.get_shape()[1], filters])
+                b = tf.get_variable("bias", [filters], initializer=tf.constant_initializer(0.0))
 
-            x = tf.nn.conv2d(input=x, filter=spectral_norm(w), strides=[1, 1, 1, 1], padding='SAME', data_format='NCHW')
-            x = tf.nn.bias_add(x, b, data_format='NCHW')
-            x = tf.nn.leaky_relu(x)
-        else:
-            w = tf.get_variable("kernel", shape=[3, 3, x.get_shape()[1], filters])
-            x = tf.nn.conv2d(input=x, filter=spectral_norm(w), strides=[1, 1, 1, 1], padding='SAME', data_format='NCHW')
+                x = tf.nn.conv2d(input=x, filter=spectral_norm(w), strides=[1, 1, 1, 1], padding='SAME', data_format='NCHW')
+                x = tf.nn.bias_add(x, b, data_format='NCHW')
+                x = tf.nn.leaky_relu(x)
+            else:
+                w = tf.get_variable("kernel", shape=[3, 3, x.get_shape()[1], filters])
+                x = tf.nn.conv2d(input=x, filter=spectral_norm(w), strides=[1, 1, 1, 1], padding='SAME', data_format='NCHW')
 
         # if not skip:
         #     x = tf.contrib.layers.conv2d(x, filters, 3, data_format='NCHW', activation_fn=tf.nn.leaky_relu)
