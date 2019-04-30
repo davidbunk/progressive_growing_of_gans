@@ -636,38 +636,96 @@ def D_paper(
 #----------------------------------------------------------------------------
 # Label Reconstructor network
 
-def image_encoder(images_in):
-    enc_list = []
+def Reconstructor(x, depth=8, n_class=3, base_filter=32):
+    """
+    Reconstructor (to do).
 
-    # Linear structure: simple but inefficient.
-    if structure == 'linear':
-        img = images_in
-        x = fromrgb(img, resolution_log2)
-        for res in range(resolution_log2, 2, -1):
-            lod = resolution_log2 - res
-            x = block(x, res)
-            img = downscale2d(img)
-            y = fromrgb(img, res - 1)
-            with tf.variable_scope('Grow_lod%d' % lod):
-                x = lerp_clip(x, y, lod_in - lod)
-        combo_out = block(x, 2)
+    :param x:
+    :param depth:
+    :return:
+    """
 
-    # Recursive structure: complex but efficient.
-    if structure == 'recursive':
-        def grow(res, lod):
-            x = lambda: fromrgb(downscale2d(images_in, 2**lod), res)
-            if lod > 0: x = cset(x, (lod_in < lod), lambda: grow(res + 1, lod - 1))
-            x = block(x(), res); y = lambda: x
-            if res > 2: y = cset(y, (lod_in > lod), lambda: lerp(x, fromrgb(downscale2d(images_in, 2**(lod+1)), res - 1), lod_in - lod))
-            return y()
-        combo_out = grow(2, resolution_log2 - 2)
+    def convolution_block(conv, filter_n, name, activation='leaky', down=True, subconvolutions=2, base_filter=32):
+        max_filter = 1024
 
-    assert combo_out.dtype == tf.as_dtype(dtype)
-    scores_out = tf.identity(combo_out[:, :1], name='scores_out')
-    labels_out = tf.identity(combo_out[:, 1:], name='labels_out')
-    return enc_list
+        for n in range(subconvolutions):
+            if n == 0 and filter_n != base_filter:
+                if down:
+                    init_n = max(filter_n // 2, base_filter)
+                else:
+                    init_n = min(filter_n * 2, max_filter)
+            else:
+                init_n = filter_n
 
+            conv = tf.layers.conv2d(inputs=conv,
+                                    filters=filter_n,
+                                    kernel_size=kernel_size,
+                                    strides=1,
+                                    padding='SAME',
+                                    activation=tf.nn.leaky_relu,
+                                    data_format='NCHW',
+                                    name="convblock_{}_{}".format(name, n+1))
 
-def label_decoder(enc_list):
+        return conv
 
-    return label
+    def upconvolution(conv, old_conv, filter_n, name, activation='leaky'):
+        conv = tf.layers.conv2d_transpose(inputs=conv,
+                                          filters=filter_n,
+                                          kernel_size=kernel_size,
+                                          strides=(2, 2),
+                                          padding=padding,
+                                          activation=tf.nn.leaky_relu,
+                                          data_format='NCHW',
+                                          name="upconvolution_{}".format(name))
+
+        if old_conv is not None:
+            conv = tf.concat([conv, old_conv], axis=-1, name="upconcat_{}".format(name))
+
+        conv = convolution_block(conv, filter_n, 'up' + str(name))
+
+        return conv
+
+    with tf.variable_scope('reconstructor'):
+        filter_n = base_filter
+        conv_buffer= []
+
+        # Input layer.
+        conv = tf.layers.conv2d(inputs=input,
+                                filters=filter_n,
+                                kernel_size=kernel_size,
+                                strides=1,
+                                padding=padding,
+                                data_format='NCHW',
+                                activation=tf.nn.leaky_relu,
+                                name='input_layer')
+
+        for n in range(depth):
+            conv = convolution_block(conv, filter_n, n+1)
+
+            if n < depth-1:
+                conv_buffer.append(conv)
+
+                conv = tf.layers.max_pooling2d(
+                    inputs=conv, pool_size=(2, 2),
+                    strides=strides,
+                    padding=padding,
+                    name='downconv_{}'.format(n))
+
+            if n < depth-1:
+                filter_n = int(filter_n * 2)
+        conv_buffer.append(conv)
+        for n in range(depth-1):
+            filter_n = int(filter_n / 2)
+
+            conv = upconvolution(conv, conv_buffer[-(2+n)], filter_n, n+depth+1)
+
+        conv = tf.layers.conv2d(inputs=conv,
+                                filters=n_class,
+                                kernel_size=(1, 1),
+                                strides=1,
+                                padding=padding,
+                                data_format='NCHW',
+                                activation=tf.identity,
+                                name='output_layer')
+
+        return conv
