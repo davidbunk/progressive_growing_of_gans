@@ -222,7 +222,7 @@ def train_progressive_gan(
             # Phase 1 processing.
             lod_assign_ops = [tf.assign(G_gpu.find_var('lod'), lod_in), tf.assign(D_gpu.find_var('lod'), lod_in)]
             reals_gpu = process_reals(reals_split[gpu], lod_in, mirror_augment, training_set.dynamic_range, drange_net)
-            reals_gpu_spade = process_reals(reals_split[gpu], lod_in, mirror_augment, training_set.dynamic_range, [1, 3])
+            #reals_gpu_spade = process_reals(reals_split[gpu], lod_in, mirror_augment, training_set.dynamic_range, [1, 3])
             labels_gpu = labels_split[gpu]
 
             # Phase 2 processing.
@@ -238,9 +238,9 @@ def train_progressive_gan(
 
             # Phase 2
             with tf.name_scope('G_2_loss'), tf.control_dependencies(lod_assign_ops_2):
-                G_2_loss = tfutil.call_func_by_name(G=G_2_gpu, D=D_2_gpu, opt=G_2_opt, training_set=training_set_2, minibatch_size=minibatch_split, reallbl=reals_gpu_spade, G_old=G_2_gpu, training_set_old=training_set, **config.G_2_loss)
+                G_2_loss = tfutil.call_func_by_name(G=G_2_gpu, D=D_2_gpu, opt=G_2_opt, training_set=training_set_2, minibatch_size=minibatch_split, G_old=G_gpu, training_set_old=training_set, **config.G_2_loss)
             with tf.name_scope('D_2_loss'), tf.control_dependencies(lod_assign_ops_2):
-                D_2_loss = tfutil.call_func_by_name(G=G_2_gpu, D=D_2_gpu, opt=D_2_opt, training_set=training_set_2, minibatch_size=minibatch_split, reals=reals_2_gpu, labels=labels_2_gpu, G_old=G_2_gpu, training_set_old=training_set, reallbl=reals_gpu_spade, **config.D_2_loss)
+                D_2_loss = tfutil.call_func_by_name(G=G_2_gpu, D=D_2_gpu, opt=D_2_opt, training_set=training_set_2, minibatch_size=minibatch_split, reals=reals_2_gpu, labels=labels_2_gpu, G_old=G_gpu, training_set_old=training_set, **config.D_2_loss)
 
             # Phase 1
             G_opt.register_gradients(tf.reduce_mean(G_loss), G_gpu.trainables)
