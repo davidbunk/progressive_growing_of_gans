@@ -15,6 +15,7 @@ import traceback
 import numpy as np
 import tensorflow as tf
 import PIL.Image
+import copy
 
 import tfutil
 import dataset
@@ -63,7 +64,7 @@ class TFRecordExporter:
         np.random.RandomState(123).shuffle(order)
         return order
 
-    def add_image(self, img):
+    def add_image(self, img, augmentation):
         if self.print_progress and self.cur_images % self.progress_interval == 0:
             print('%d / %d\r' % (self.cur_images, self.expected_images), end='', flush=True)
         if self.shape is None:
@@ -90,19 +91,26 @@ class TFRecordExporter:
                 n = 1024
 
             for aug_s in range(n):
-                augimg = elastic_steps(img, lod)
+                if augmentation:
+                    augimg = elastic_steps(img, lod)
 
-                # Save images for control.
-                # augimg = augimg[0,:,:]
-                # augimg = np.expand_dims(augimg, axis=-1)
-                # imsave(self.tfr_prefix + '/' + str(np.max(img.shape)) + '/' + str(aug_s) + '.png', augimg)
+                    # Save images for control.
+                    # augimg = augimg[0,:,:]
+                    # augimg = np.expand_dims(augimg, axis=-1)
+                    # imsave(self.tfr_prefix + '/' + str(np.max(img.shape)) + '/' + str(aug_s) + '.png', augimg)
 
-                if lod:
-                    img = img.astype(np.float32)
-                    if lod == 1:
-                        img = img[:, 0::2,0::2]  # + img[:, 0::2, 1::2] + img[:, 1::2, 0::2] + img[:, 1::2, 1::2]) * 0.25
-                    else:
-                        img = resize(img, (1, 1024/2**lod, 1024/2**lod), order=3, clip=False, anti_aliasing=True, preserve_range=True)
+                    if lod:
+                        augimg = augimg.astype(np.float32)
+                        if lod == 1:
+                            augimg = augimg[:, 0::2,0::2]  # + img[:, 0::2, 1::2] + img[:, 1::2, 0::2] + img[:, 1::2, 1::2]) * 0.25
+                        else:
+                            augimg = resize(augimg, (1, 1024/2**lod, 1024/2**lod), order=3, clip=False, anti_aliasing=True, preserve_range=True)
+                else:
+                    if aug_s == 0:
+                        augimg = copy.deepcopy(img)
+                        augimg = augimg.astype(np.float32)
+                        if lod:
+                            augimg = resize(augimg, (1, 1024/2**lod, 1024/2**lod), order=3, clip=False, anti_aliasing=True, preserve_range=True)
 
                 quant = np.rint(augimg).clip(0, 255).astype(np.uint8)
                 ex = tf.train.Example(features=tf.train.Features(feature={
@@ -622,7 +630,7 @@ def create_celebahq(tfrecord_dir, celeba_dir, delta_dir, num_threads=4, num_task
 
 #----------------------------------------------------------------------------
 
-def create_from_images(tfrecord_dir, image_dir, shuffle):
+def create_from_images(tfrecord_dir, image_dir, shuffle, augmentation=False):
     print('Loading images from "%s"' % image_dir)
     image_filenames = sorted(glob.glob(image_dir, recursive=True))
     if len(image_filenames) == 0:
@@ -651,7 +659,7 @@ def create_from_images(tfrecord_dir, image_dir, shuffle):
 
         with ThreadPool(15) as pool:
             for img in pool.process_items_concurrently(order.tolist(), process_func=process_func, max_items_in_flight=15):
-                tfr.add_image(img)
+                tfr.add_image(img, augmentation)
 
 #----------------------------------------------------------------------------
 
