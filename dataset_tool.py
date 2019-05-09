@@ -20,6 +20,8 @@ import tfutil
 import dataset
 #from scipy.ndimage.interpolation import map_coordinates
 from scipy.ndimage.filters import gaussian_filter
+from skimage.io import imsave
+from skimage.transform import resize
 
 #----------------------------------------------------------------------------
 
@@ -30,7 +32,7 @@ def error(msg):
 #----------------------------------------------------------------------------
 
 class TFRecordExporter:
-    def __init__(self, tfrecord_dir, expected_images, print_progress=True, progress_interval=10):
+    def __init__(self, tfrecord_dir, expected_images, print_progress=True, progress_interval=1):
         self.tfrecord_dir       = tfrecord_dir
         self.tfr_prefix         = os.path.join(self.tfrecord_dir, os.path.basename(self.tfrecord_dir))
         self.expected_images    = expected_images
@@ -76,21 +78,32 @@ class TFRecordExporter:
                 self.tfr_writers.append(tf.python_io.TFRecordWriter(tfr_file, tfr_opt))
         assert img.shape == self.shape
         for lod, tfr_writer in enumerate(self.tfr_writers):
-            if lod:
-                img = img.astype(np.float32)
-                img = img[:, 0::2, 0::2] # + img[:, 0::2, 1::2] + img[:, 1::2, 0::2] + img[:, 1::2, 1::2]) * 0.25
-
-            if np.max(img.shape) in [1024, 512]:
-                n = 1
-            elif np.max(img.shape) in [256]:
+            if lod in [0, 1]:
+                n = 128
+            elif lod in [2]:
                 n = 256
-            elif np.max(img.shape) in [128, 16, 8, 4]:
+            elif lod in [3, 6]:
                 n = 1024
-            elif np.max(img.shape) in [64, 32]:
+            elif lod in [4, 5]:
                 n = 2048
+            elif lod in [7, 8]:
+                n = 1024
 
             for aug_s in range(n):
-                augimg = elastic_steps(img)
+                augimg = elastic_steps(img, lod)
+
+                # Save images for control.
+                # augimg = augimg[0,:,:]
+                # augimg = np.expand_dims(augimg, axis=-1)
+                # imsave(self.tfr_prefix + '/' + str(np.max(img.shape)) + '/' + str(aug_s) + '.png', augimg)
+
+                if lod:
+                    img = img.astype(np.float32)
+                    if lod == 1:
+                        img = img[:, 0::2,0::2]  # + img[:, 0::2, 1::2] + img[:, 1::2, 0::2] + img[:, 1::2, 1::2]) * 0.25
+                    else:
+                        img = resize(img, (1, 1024/2**lod, 1024/2**lod), order=3, clip=False, anti_aliasing=True, preserve_range=True)
+
                 quant = np.rint(augimg).clip(0, 255).astype(np.uint8)
                 ex = tf.train.Example(features=tf.train.Features(feature={
                     'shape': tf.train.Feature(int64_list=tf.train.Int64List(value=quant.shape)),
@@ -775,23 +788,25 @@ def elastic_transform(image, alpha, sigma, random_state=None):
 
 #----------------------------------------------------------------------------
 
-def elastic_steps(img, random_state=None):
-    if np.max(img.shape)==512:
-        img = elastic_transform(img, np.max(img.shape) * 3, np.max(img.shape) * 0.09, random_state=random_state)
-    elif np.max(img.shape)==256:
-        img = elastic_transform(img, np.max(img.shape) * 2, np.max(img.shape) * 0.07, random_state=random_state)
-    elif np.max(img.shape)==128:
-        img = elastic_transform(img, np.max(img.shape) * 1, np.max(img.shape) * 0.07, random_state=random_state)
-    elif np.max(img.shape)==64:
-        img = elastic_transform(img, np.max(img.shape) * 1, np.max(img.shape) * 0.08, random_state=random_state)
-    elif np.max(img.shape)==32:
-        img = elastic_transform(img, np.max(img.shape) * 1, np.max(img.shape) * 0.1, random_state=random_state)
-    elif np.max(img.shape)==16:
-        img = elastic_transform(img, np.max(img.shape) * 1, np.max(img.shape) * 0.2, random_state=random_state)
-    elif np.max(img.shape)==8:
-        img = elastic_transform(img, np.max(img.shape) * 1, np.max(img.shape) * 0.3, random_state=random_state)
-    elif np.max(img.shape)==4:
-        img = elastic_transform(img, np.max(img.shape) * 1, np.max(img.shape) * 0.4, random_state=random_state)
+def elastic_steps(img, lod, random_state=None):
+    if lod == 0:
+        img = elastic_transform(img, np.max(img.shape) * 4, np.max(img.shape) * 0.06, random_state=random_state)
+    elif lod == 1:
+        img = elastic_transform(img, np.max(img.shape) * 8, np.max(img.shape) * 0.1, random_state=random_state)
+    elif lod == 2:
+        img = elastic_transform(img, np.max(img.shape) * 16, np.max(img.shape) * 0.15, random_state=random_state)
+    elif lod == 3:
+        img = elastic_transform(img, np.max(img.shape) * 32, np.max(img.shape) * 0.2, random_state=random_state)
+    elif lod == 4:
+        img = elastic_transform(img, np.max(img.shape) * 64, np.max(img.shape) * 0.3, random_state=random_state)
+    elif lod == 5:
+        img = elastic_transform(img, np.max(img.shape) * 128, np.max(img.shape) * 0.4, random_state=random_state)
+    elif lod == 6:
+        img = elastic_transform(img, np.max(img.shape) * 256, np.max(img.shape) * 0.5, random_state=random_state)
+    # elif lod ==8:
+    #     img = elastic_transform(img, np.max(img.shape) * 1, np.max(img.shape) * 0.3, random_state=random_state)
+    # elif lod ==4:
+    #     img = elastic_transform(img, np.max(img.shape) * 1, np.max(img.shape) * 0.4, random_state=random_state)
     else:
         img = img
 
