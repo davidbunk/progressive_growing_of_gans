@@ -107,7 +107,7 @@ class TFRecordExporter:
                     # if len(augimg.shape) == 2:
                     #     augimg = augimg[np.newaxis, :, :] # HW => CHW
                     # else:
-                    augimg = augimg.transpose(2, 0, 1) # HWC => CHW
+                    augimg = np.moveaxis(augimg, 2, 0) # HWC => CHW
                 else:
                     if aug_s == 0:
                         augimg = copy.deepcopy(img)
@@ -656,15 +656,14 @@ def create_from_images(tfrecord_dir, image_dir, shuffle, augmentation=False):
 
     with TFRecordExporter(tfrecord_dir, len(image_filenames)) as tfr:
         order = tfr.choose_shuffled_order() if shuffle else np.arange(len(image_filenames))
-        #for idx in range(order.size):
-        def process_func(idx):
+        for idx in range(order.size):
             img = np.asarray(PIL.Image.open(image_filenames[order[idx]]))
 
-            return img
-
-        with ThreadPool(15) as pool:
-            for img in pool.process_items_concurrently(order.tolist(), process_func=process_func, max_items_in_flight=15):
-                tfr.add_image(img, augmentation)
+            # if channels == 1:
+            #     img = img[np.newaxis, :, :] # HW => CHW
+            # else:
+            #     img = img.transpose(2, 0, 1) # HWC => CHW
+            tfr.add_image(img, augmentation)
 
 #----------------------------------------------------------------------------
 
