@@ -25,14 +25,14 @@ import dataset
 # Generate random images or image grids using a previously trained network.
 # To run, uncomment the appropriate line in config.py and launch train.py.
 
-def generate_fake_images(run_id, snapshot=None, grid_size=[1,1], num_pngs=1, image_shrink=1, png_prefix=None, random_seed=1000, minibatch_size=8):
+def generate_fake_images(run_id, snapshot=6560, grid_size=[1,1], num_pngs=1, image_shrink=1, png_prefix=None, random_seed=1000, minibatch_size=8):
     network_pkl = misc.locate_network_pkl(run_id, snapshot)
     if png_prefix is None:
         png_prefix = misc.get_id_string_for_network_pkl(network_pkl) + '-'
     random_state = np.random.RandomState(random_seed)
 
     print('Loading network from "%s"...' % network_pkl)
-    G, D, Gs = misc.load_network_pkl(run_id, snapshot)
+    G, D, Gs, _, _, _ = misc.load_network_pkl(run_id, snapshot)
 
     result_subdir = misc.create_result_subdir(config.result_dir, config.desc)
     for png_idx in range(num_pngs):
@@ -55,7 +55,7 @@ def generate_interpolation_video(run_id, snapshot=None, grid_size=[1,1], image_s
     random_state = np.random.RandomState(random_seed)
 
     print('Loading network from "%s"...' % network_pkl)
-    G, D, Gs = misc.load_network_pkl(run_id, snapshot)
+    G, D, Gs, _, _, _ = misc.load_network_pkl(run_id, snapshot)
 
     print('Generating latent vectors...')
     shape = [num_frames, np.prod(grid_size)] + Gs.input_shape[1:] # [frame, image, channel, component]
