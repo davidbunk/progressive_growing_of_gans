@@ -70,8 +70,8 @@ class TFRecordExporter:
         if self.shape is None:
             self.shape = img.shape
             self.resolution_log2 = int(np.log2(self.shape[1]))
-            assert self.shape[0] in [1, 3]
-            assert self.shape[1] == self.shape[2]
+            #assert self.shape[0] in [1, 3]
+            assert self.shape[0] == self.shape[1]
             assert self.shape[1] == 2**self.resolution_log2
             tfr_opt = tf.python_io.TFRecordOptions(tf.python_io.TFRecordCompressionType.NONE)
             for lod in range(self.resolution_log2 - 1):
@@ -95,22 +95,30 @@ class TFRecordExporter:
                     augimg = elastic_steps(img, lod)
 
                     # Save images for control.
-                    # augimg = augimg[0,:,:]
-                    # augimg = np.expand_dims(augimg, axis=-1)
-                    # imsave(self.tfr_prefix + '/' + str(np.max(img.shape)) + '/' + str(aug_s) + '.png', augimg)
+                    #np.save(self.tfr_prefix + '/' + str(np.max(img.shape)) + '/' + str(aug_s) + '.png', augimg)
 
                     if lod:
                         augimg = augimg.astype(np.float32)
                         if lod == 1:
-                            augimg = augimg[:, 0::2,0::2]  # + img[:, 0::2, 1::2] + img[:, 1::2, 0::2] + img[:, 1::2, 1::2]) * 0.25
+                            augimg = augimg[0::2,0::2, :]  # + img[:, 0::2, 1::2] + img[:, 1::2, 0::2] + img[:, 1::2, 1::2]) * 0.25
                         else:
-                            augimg = resize(augimg, (1, 1024/2**lod, 1024/2**lod), order=3, clip=False, anti_aliasing=True, preserve_range=True)
+                            augimg = resize(augimg, (1024/2**lod, 1024/2**lod), order=3, clip=False, anti_aliasing=True, preserve_range=True)
+
+                    # if len(augimg.shape) == 2:
+                    #     augimg = augimg[np.newaxis, :, :] # HW => CHW
+                    # else:
+                    augimg = augimg.transpose(2, 0, 1) # HWC => CHW
                 else:
                     if aug_s == 0:
                         augimg = copy.deepcopy(img)
                         augimg = augimg.astype(np.float32)
                         if lod:
-                            augimg = resize(augimg, (1, 1024/2**lod, 1024/2**lod), order=3, clip=False, anti_aliasing=True, preserve_range=True)
+                            augimg = resize(augimg, (1024/2**lod, 1024/2**lod), order=3, clip=False, anti_aliasing=True, preserve_range=True)
+
+                        if len(augimg.shape) == 2:
+                            augimg = augimg[np.newaxis, :, :] # HW => CHW
+                        else:
+                            augimg = augimg.transpose(2, 0, 1) # HWC => CHW
 
                 quant = np.rint(augimg).clip(0, 255).astype(np.uint8)
                 ex = tf.train.Example(features=tf.train.Features(feature={
@@ -651,10 +659,7 @@ def create_from_images(tfrecord_dir, image_dir, shuffle, augmentation=False):
         #for idx in range(order.size):
         def process_func(idx):
             img = np.asarray(PIL.Image.open(image_filenames[order[idx]]))
-            if channels == 1:
-                img = img[np.newaxis, :, :] # HW => CHW
-            else:
-                img = img.transpose(2, 0, 1) # HWC => CHW
+
             return img
 
         with ThreadPool(15) as pool:
@@ -797,7 +802,19 @@ def elastic_transform(image, alpha, sigma, random_state=None):
         x, y = np.meshgrid(np.arange(np.max(shape)), np.arange(np.max(shape)))
         indices = np.reshape(y+dy, (-1, 1)), np.reshape(x+dx, (-1, 1))
 
-        return map_coordinates(image, indices, order=1, mode='reflect').reshape(shape)
+        mem = np.zeros_like(image)
+        mito = np.zeros_like(image)
+
+        mem[image == 127] = 255
+        mito[image == 255] = 255
+
+        mem = map_coordinates(mem, indices, order=1, mode='reflect').reshape(shape)
+        mito = map_coordinates(mito, indices, order=1, mode='reflect').reshape(shape)
+
+        mem = np.expand_dims(mem, axis=-1)
+        mito = np.expand_dims(mito, axis=-1)
+
+        return np.concatenate([mem, mito], axis=-1)
 
 #----------------------------------------------------------------------------
 
@@ -834,7 +851,6 @@ from scipy.misc import doccer
 
 def map_coordinates(input, coordinates, output=None, order=3,
 mode='constant', cval=0.0, prefilter=True):
-    input = input[0,:,:]
     if order < 0 or order > 5:
         raise RuntimeError('spline order not supported')
     input = np.asarray(input)
