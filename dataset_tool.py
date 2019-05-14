@@ -17,12 +17,18 @@ import tensorflow as tf
 import PIL.Image
 import copy
 
+import math
+import warnings
+from scipy.ndimage import _ni_support, _nd_image
+from scipy.misc import doccer
+
 import tfutil
 import dataset
-#from scipy.ndimage.interpolation import map_coordinates
-from scipy.ndimage.filters import gaussian_filter
+import scipy.signal
 from skimage.io import imsave
 from skimage.transform import resize
+import multiprocessing
+from numba import jit, njit
 
 #----------------------------------------------------------------------------
 
@@ -41,6 +47,7 @@ class TFRecordExporter:
         self.shape              = None
         self.resolution_log2    = None
         self.tfr_writers        = []
+        self.cache = []
         self.print_progress     = print_progress
         self.progress_interval  = progress_interval
         if self.print_progress:
@@ -64,68 +71,81 @@ class TFRecordExporter:
         np.random.RandomState(123).shuffle(order)
         return order
 
-    def add_image(self, img, augmentation):
+    def init_writers(self, img):
+        self.shape = img.shape
+        self.resolution_log2 = int(np.log2(self.shape[1]))
+        tfr_opt = tf.python_io.TFRecordOptions(tf.python_io.TFRecordCompressionType.NONE)
+        for lod in range(self.resolution_log2 - 1):
+            tfr_file = self.tfr_prefix + '-r%02d.tfrecords' % (self.resolution_log2 - lod)
+            self.tfr_writers.append(tf.python_io.TFRecordWriter(tfr_file, tfr_opt))
+
+    def add_image(self, img, lod, augmentation):
+        if self.tfr_writers == []:
+            self.init_writers(img)
+
         if self.print_progress and self.cur_images % self.progress_interval == 0:
             print('%d / %d\r' % (self.cur_images, self.expected_images), end='', flush=True)
         if self.shape is None:
             self.shape = img.shape
-            self.resolution_log2 = int(np.log2(self.shape[1]))
             #assert self.shape[0] in [1, 3]
             assert self.shape[0] == self.shape[1]
             assert self.shape[1] == 2**self.resolution_log2
-            tfr_opt = tf.python_io.TFRecordOptions(tf.python_io.TFRecordCompressionType.NONE)
-            for lod in range(self.resolution_log2 - 1):
-                tfr_file = self.tfr_prefix + '-r%02d.tfrecords' % (self.resolution_log2 - lod)
-                self.tfr_writers.append(tf.python_io.TFRecordWriter(tfr_file, tfr_opt))
+
         assert img.shape == self.shape
-        for lod, tfr_writer in enumerate(self.tfr_writers):
-            if lod in [0, 1]:
-                n = 128
-            elif lod in [2]:
-                n = 256
-            elif lod in [3, 6]:
-                n = 1024
-            elif lod in [4, 5]:
-                n = 2048
-            elif lod in [7, 8]:
-                n = 1024
+        #for lod, tfr_writer in enumerate(self.tfr_writers):
 
-            for aug_s in range(n):
-                if augmentation:
-                    augimg = elastic_steps(img, lod)
+        #tfr_writer = self.tfr_writers[lod]
+        cache = []
 
-                    # Save images for control.
-                    #np.save(self.tfr_prefix + '/' + str(np.max(img.shape)) + '/' + str(aug_s) + '.png', augimg)
+        if lod in [0, 1]:
+            n = 128
+        elif lod in [2]:
+            n = 256
+        elif lod in [3, 6]:
+            n = 1024
+        elif lod in [4, 5]:
+            n = 2048
+        elif lod in [7, 8]:
+            n = 1024
 
+        for aug_s in range(n):
+            if augmentation:
+                augimg = elastic_steps(img, lod)
+
+                # Save images for control.
+                #np.save(self.tfr_prefix + '/' + str(np.max(img.shape)) + '/' + str(aug_s) + '.png', augimg)
+
+                if lod:
+                    augimg = augimg.astype(np.float32)
+                    if lod == 1:
+                        augimg = augimg[0::2,0::2, :]  # + img[:, 0::2, 1::2] + img[:, 1::2, 0::2] + img[:, 1::2, 1::2]) * 0.25
+                    else:
+                        augimg = resize(augimg, (1024/2**lod, 1024/2**lod), order=3, clip=False, anti_aliasing=True, preserve_range=True)
+
+                # if len(augimg.shape) == 2:
+                #     augimg = augimg[np.newaxis, :, :] # HW => CHW
+                # else:
+                augimg = np.moveaxis(augimg, 2, 0) # HWC => CHW
+            else:
+                if aug_s == 0:
+                    augimg = copy.deepcopy(img)
+                    augimg = augimg.astype(np.float32)
                     if lod:
-                        augimg = augimg.astype(np.float32)
-                        if lod == 1:
-                            augimg = augimg[0::2,0::2, :]  # + img[:, 0::2, 1::2] + img[:, 1::2, 0::2] + img[:, 1::2, 1::2]) * 0.25
-                        else:
-                            augimg = resize(augimg, (1024/2**lod, 1024/2**lod), order=3, clip=False, anti_aliasing=True, preserve_range=True)
+                        augimg = resize(augimg, (1024/2**lod, 1024/2**lod), order=3, clip=False, anti_aliasing=True, preserve_range=True)
 
-                    # if len(augimg.shape) == 2:
-                    #     augimg = augimg[np.newaxis, :, :] # HW => CHW
-                    # else:
-                    augimg = np.moveaxis(augimg, 2, 0) # HWC => CHW
-                else:
-                    if aug_s == 0:
-                        augimg = copy.deepcopy(img)
-                        augimg = augimg.astype(np.float32)
-                        if lod:
-                            augimg = resize(augimg, (1024/2**lod, 1024/2**lod), order=3, clip=False, anti_aliasing=True, preserve_range=True)
+                    if len(augimg.shape) == 2:
+                        augimg = augimg[np.newaxis, :, :] # HW => CHW
+                    else:
+                        augimg = augimg.transpose(2, 0, 1) # HWC => CHW
 
-                        if len(augimg.shape) == 2:
-                            augimg = augimg[np.newaxis, :, :] # HW => CHW
-                        else:
-                            augimg = augimg.transpose(2, 0, 1) # HWC => CHW
-
-                quant = np.rint(augimg).clip(0, 255).astype(np.uint8)
-                ex = tf.train.Example(features=tf.train.Features(feature={
-                    'shape': tf.train.Feature(int64_list=tf.train.Int64List(value=quant.shape)),
-                    'data': tf.train.Feature(bytes_list=tf.train.BytesList(value=[quant.tostring()]))}))
-                tfr_writer.write(ex.SerializeToString())
+            quant = np.rint(augimg).clip(0, 255).astype(np.uint8)
+            # ex = tf.train.Example(features=tf.train.Features(feature={
+            #     'shape': tf.train.Feature(int64_list=tf.train.Int64List(value=quant.shape)),
+            #     'data': tf.train.Feature(bytes_list=tf.train.BytesList(value=[quant.tostring()]))}))
+            #tfr_writer.write(ex.SerializeToString())
+            cache.append(quant)
         self.cur_images += 1
+        return cache
 
     def add_labels(self, labels):
         if self.print_progress:
@@ -133,7 +153,16 @@ class TFRecordExporter:
         assert labels.shape[0] == self.cur_images
         with open(self.tfr_prefix + '-rxx.labels', 'wb') as f:
             np.save(f, labels.astype(np.float32))
-            
+
+    def save(self, lod, cache):
+        print('Saving!')
+        print(len(cache))
+        for quant in cache:
+            ex = tf.train.Example(features=tf.train.Features(feature={
+                'shape': tf.train.Feature(int64_list=tf.train.Int64List(value=quant.shape)),
+                'data': tf.train.Feature(bytes_list=tf.train.BytesList(value=[quant.tostring()]))}))
+            self.tfr_writers[lod].write(ex.SerializeToString())
+
     def __enter__(self):
         return self
     
@@ -654,16 +683,44 @@ def create_from_images(tfrecord_dir, image_dir, shuffle, augmentation=False):
     if channels not in [1, 3]:
         error('Input images must be stored as RGB or grayscale')
 
+    def do_image(idx, lod, return_dict):
+        img = np.asarray(PIL.Image.open(image_filenames[order[idx]]))
+        cache = tfr.add_image(img, lod, augmentation)
+
+        return_dict[idx] = cache
+
     with TFRecordExporter(tfrecord_dir, len(image_filenames)) as tfr:
         order = tfr.choose_shuffled_order() if shuffle else np.arange(len(image_filenames))
-        for idx in range(order.size):
-            img = np.asarray(PIL.Image.open(image_filenames[order[idx]]))
+        tfr.init_writers(np.asarray(PIL.Image.open(image_filenames[order[0]])))
 
-            # if channels == 1:
-            #     img = img[np.newaxis, :, :] # HW => CHW
-            # else:
-            #     img = img.transpose(2, 0, 1) # HWC => CHW
-            tfr.add_image(img, augmentation)
+        manager = multiprocessing.Manager()
+        return_dict = manager.dict()
+
+        for lod in range(len(tfr.tfr_writers)):
+            processes = []
+            for idx in range(order.size):
+                t = multiprocessing.Process(target=do_image, args=(idx, lod, return_dict))
+                processes.append(t)
+                t.start()
+
+            for one_process in processes:
+                one_process.join()
+
+            cache = []
+            for item in return_dict:
+                cache = cache + return_dict[item]
+
+            tfr.save(lod, cache)
+
+            # img = np.asarray(PIL.Image.open(image_filenames[order[idx]]))
+            #
+            # # if channels == 1:
+            # #     img = img[np.newaxis, :, :] # HW => CHW
+            # # else:
+            # #     img = img.transpose(2, 0, 1) # HWC => CHW
+            # tfr.add_image(img, augmentation)
+
+
 
 #----------------------------------------------------------------------------
 
@@ -778,6 +835,170 @@ def execute_cmdline(argv):
 
 #----------------------------------------------------------------------------
 
+
+def gkern(sigma=1.):
+    """
+    creates gaussian kernel with side length l and a sigma of sig
+    """
+
+    l = int(4.0 * sigma + 0.5) * 2
+
+    ax = np.arange(-l // 2 + 1., l // 2 + 1.)
+    xx, yy = np.meshgrid(ax, ax)
+
+    kernel = np.exp(-0.5 * (np.square(xx) + np.square(yy)) / np.square(sigma))
+
+    return kernel / np.sum(kernel)
+
+
+def fftconvolve(in1, in2, mode="full", axes=None):
+    """Convolve two N-dimensional arrays using FFT.
+    Convolve `in1` and `in2` using the fast Fourier transform method, with
+    the output size determined by the `mode` argument.
+    This is generally much faster than `convolve` for large arrays (n > ~500),
+    but can be slower when only a few output values are needed, and can only
+    output float arrays (int or object array inputs will be cast to float).
+    As of v0.19, `convolve` automatically chooses this method or the direct
+    method based on an estimation of which is faster.
+    Parameters
+    ----------
+    in1 : array_like
+        First input.
+    in2 : array_like
+        Second input. Should have the same number of dimensions as `in1`.
+    mode : str {'full', 'valid', 'same'}, optional
+        A string indicating the size of the output:
+        ``full``
+           The output is the full discrete linear convolution
+           of the inputs. (Default)
+        ``valid``
+           The output consists only of those elements that do not
+           rely on the zero-padding. In 'valid' mode, either `in1` or `in2`
+           must be at least as large as the other in every dimension.
+        ``same``
+           The output is the same size as `in1`, centered
+           with respect to the 'full' output.
+           axis : tuple, optional
+    axes : int or array_like of ints or None, optional
+        Axes over which to compute the convolution.
+        The default is over all axes.
+    Returns
+    -------
+    out : array
+        An N-dimensional array containing a subset of the discrete linear
+        convolution of `in1` with `in2`.
+    Examples
+    --------
+    Autocorrelation of white noise is an impulse.
+    >>> from scipy import signal
+    >>> sig = np.random.randn(1000)
+    >>> autocorr = signal.fftconvolve(sig, sig[::-1], mode='full')
+    >>> import matplotlib.pyplot as plt
+    >>> fig, (ax_orig, ax_mag) = plt.subplots(2, 1)
+    >>> ax_orig.plot(sig)
+    >>> ax_orig.set_title('White noise')
+    >>> ax_mag.plot(np.arange(-len(sig)+1,len(sig)), autocorr)
+    >>> ax_mag.set_title('Autocorrelation')
+    >>> fig.tight_layout()
+    >>> fig.show()
+    Gaussian blur implemented using FFT convolution.  Notice the dark borders
+    around the image, due to the zero-padding beyond its boundaries.
+    The `convolve2d` function allows for other types of image boundaries,
+    but is far slower.
+    >>> from scipy import misc
+    >>> face = misc.face(gray=True)
+    >>> kernel = np.outer(signal.gaussian(70, 8), signal.gaussian(70, 8))
+    >>> blurred = signal.fftconvolve(face, kernel, mode='same')
+    >>> fig, (ax_orig, ax_kernel, ax_blurred) = plt.subplots(3, 1,
+    ...                                                      figsize=(6, 15))
+    >>> ax_orig.imshow(face, cmap='gray')
+    >>> ax_orig.set_title('Original')
+    >>> ax_orig.set_axis_off()
+    >>> ax_kernel.imshow(kernel, cmap='gray')
+    >>> ax_kernel.set_title('Gaussian kernel')
+    >>> ax_kernel.set_axis_off()
+    >>> ax_blurred.imshow(blurred, cmap='gray')
+    >>> ax_blurred.set_title('Blurred')
+    >>> ax_blurred.set_axis_off()
+    >>> fig.show()
+    """
+    in1 = asarray(in1)
+    in2 = asarray(in2)
+    noaxes = axes is None
+
+    if in1.ndim == in2.ndim == 0:  # scalar inputs
+        return in1 * in2
+    elif in1.ndim != in2.ndim:
+        raise ValueError("in1 and in2 should have the same dimensionality")
+    elif in1.size == 0 or in2.size == 0:  # empty arrays
+        return array([])
+
+    _, axes = _init_nd_shape_and_axes_sorted(in1, shape=None, axes=axes)
+
+    if not noaxes and not axes.size:
+        raise ValueError("when provided, axes cannot be empty")
+
+    if noaxes:
+        other_axes = array([], dtype=np.intc)
+    else:
+        other_axes = np.setdiff1d(np.arange(in1.ndim), axes)
+
+    s1 = array(in1.shape)
+    s2 = array(in2.shape)
+
+    if not np.all((s1[other_axes] == s2[other_axes])
+                  | (s1[other_axes] == 1) | (s2[other_axes] == 1)):
+        raise ValueError("incompatible shapes for in1 and in2:"
+                         " {0} and {1}".format(in1.shape, in2.shape))
+
+    complex_result = (np.issubdtype(in1.dtype, np.complexfloating)
+                      or np.issubdtype(in2.dtype, np.complexfloating))
+    shape = np.maximum(s1, s2)
+    shape[axes] = s1[axes] + s2[axes] - 1
+
+    # Check that input sizes are compatible with 'valid' mode
+    if _inputs_swap_needed(mode, s1, s2):
+        # Convolution is commutative; order doesn't have any effect on output
+        in1, s1, in2, s2 = in2, s2, in1, s1
+
+    # Speed up FFT by padding to optimal size for FFTPACK
+    fshape = [fftpack.helper.next_fast_len(d) for d in shape[axes]]
+    fslice = tuple([slice(sz) for sz in shape])
+    # Pre-1.9 NumPy FFT routines are not threadsafe.  For older NumPys, make
+    # sure we only call rfftn/irfftn from one thread at a time.
+    if not complex_result and (_rfft_mt_safe or _rfft_lock.acquire(False)):
+        try:
+            sp1 = cupy.fft.rfftn(in1, fshape, axes=axes)
+            sp2 = cupy.fft.rfftn(in2, fshape, axes=axes)
+            ret = cupy.fft.irfftn(sp1 * sp2, fshape, axes=axes)[fslice].copy()
+        finally:
+            if not _rfft_mt_safe:
+                _rfft_lock.release()
+    else:
+        print('NO GPU ACCELERATION!')
+        # If we're here, it's either because we need a complex result, or we
+        # failed to acquire _rfft_lock (meaning rfftn isn't threadsafe and
+        # is already in use by another thread).  In either case, use the
+        # (threadsafe but slower) SciPy complex-FFT routines instead.
+        sp1 = fftpack.fftn(in1, fshape, axes=axes)
+        sp2 = fftpack.fftn(in2, fshape, axes=axes)
+        ret = fftpack.ifftn(sp1 * sp2, axes=axes)[fslice].copy()
+        if not complex_result:
+            ret = ret.real
+
+    if mode == "full":
+        return ret
+    elif mode == "same":
+        return _centered(ret, s1)
+    elif mode == "valid":
+        shape_valid = shape.copy()
+        shape_valid[axes] = s1[axes] - s2[axes] + 1
+        return _centered(ret, shape_valid)
+    else:
+        raise ValueError("acceptable mode flags are 'valid',"
+                         " 'same', or 'full'")
+
+
 def elastic_transform(image, alpha, sigma, random_state=None):
         """Elastic deformation of images as described in [Simard2003]_ (with modifications).
         .. [Simard2003] Simard, Steinkraus and Platt, "Best Practices for
@@ -790,10 +1011,14 @@ def elastic_transform(image, alpha, sigma, random_state=None):
         if random_state is None:
             random_state = np.random.RandomState(None)
 
+        scipy.signal.fftconvolve = fftconvolve
+
         shape = image.shape
 
-        dx = gaussian_filter((random_state.rand(*shape) * 2 - 1), sigma) * alpha
-        dy = gaussian_filter((random_state.rand(*shape) * 2 - 1), sigma) * alpha
+        kernel = gkern(sigma)
+
+        dx = scipy.signal.fftconvolve((random_state.rand(*shape) * 2 - 1), kernel, mode='same') * alpha
+        dy = scipy.signal.fftconvolve((random_state.rand(*shape) * 2 - 1), kernel, mode='same') * alpha
 
         dx = np.round(dx).astype(int)
         dy = np.round(dy).astype(int)
@@ -815,6 +1040,20 @@ def elastic_transform(image, alpha, sigma, random_state=None):
 
         return np.concatenate([mem, mito], axis=-1)
 
+
+def dummy_transform(image):
+    mem = np.zeros_like(image)
+    mito = np.zeros_like(image)
+
+    mem[image == 127] = 255
+    mito[image == 255] = 255
+
+    if len(mem.shape) < 3:
+        mem = np.expand_dims(mem, axis=-1)
+        mito = np.expand_dims(mito, axis=-1)
+
+    return np.concatenate([mem, mito], axis=-1)
+
 #----------------------------------------------------------------------------
 
 def elastic_steps(img, lod, random_state=None):
@@ -832,22 +1071,20 @@ def elastic_steps(img, lod, random_state=None):
         img = elastic_transform(img, np.max(img.shape) * 128, np.max(img.shape) * 0.4, random_state=random_state)
     elif lod == 6:
         img = elastic_transform(img, np.max(img.shape) * 256, np.max(img.shape) * 0.5, random_state=random_state)
-    # elif lod ==8:
-    #     img = elastic_transform(img, np.max(img.shape) * 1, np.max(img.shape) * 0.3, random_state=random_state)
-    # elif lod ==4:
-    #     img = elastic_transform(img, np.max(img.shape) * 1, np.max(img.shape) * 0.4, random_state=random_state)
+    elif lod ==7:
+        #img = elastic_transform(img, np.max(img.shape) * 1, np.max(img.shape) * 0.003, random_state=random_state)
+        img = dummy_transform(img)
+    elif lod ==8:
+        #img = elastic_transform(img, np.max(img.shape) * 1, np.max(img.shape) * 0.003, random_state=random_state)
+        img = dummy_transform(img)
     else:
-        img = img
+        #img = elastic_transform(img, np.max(img.shape) * 1, np.max(img.shape) * 0.003, random_state=random_state)
+        img = dummy_transform(img)
 
     return img
 
 
-
-import math
-import warnings
-from scipy.ndimage import _ni_support, _nd_image
-from scipy.misc import doccer
-
+@jit(fastmath=True, parallel=True, cache=True)
 def map_coordinates(input, coordinates, output=None, order=3,
 mode='constant', cval=0.0, prefilter=True):
     if order < 0 or order > 5:
