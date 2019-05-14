@@ -22,6 +22,20 @@ import warnings
 from scipy.ndimage import _ni_support, _nd_image
 from scipy.misc import doccer
 
+from scipy._lib.six import callable
+from scipy._lib._version import NumpyVersion
+from scipy import fftpack, linalg
+from scipy.fftpack.helper import _init_nd_shape_and_axes_sorted
+from numpy import (allclose, angle, arange, argsort, array, asarray,
+                   atleast_1d, atleast_2d, cast, dot, exp, expand_dims,
+                   iscomplexobj, mean, ndarray, newaxis, ones, pi,
+                   poly, polyadd, polyder, polydiv, polymul, polysub, polyval,
+                   product, r_, ravel, real_if_close, reshape,
+                   roots, sort, take, transpose, unique, where, zeros,
+                   zeros_like)
+import math
+import cupy
+
 import tfutil
 import dataset
 import scipy.signal
@@ -79,7 +93,7 @@ class TFRecordExporter:
             tfr_file = self.tfr_prefix + '-r%02d.tfrecords' % (self.resolution_log2 - lod)
             self.tfr_writers.append(tf.python_io.TFRecordWriter(tfr_file, tfr_opt))
 
-    def add_image(self, img, lod, augmentation):
+    def add_image(self, img, lod, augmentation, fft_dict):
         if self.tfr_writers == []:
             self.init_writers(img)
 
@@ -110,7 +124,7 @@ class TFRecordExporter:
 
         for aug_s in range(n):
             if augmentation:
-                augimg = elastic_steps(img, lod)
+                augimg = elastic_steps(img, lod, fft_dict)
 
                 # Save images for control.
                 #np.save(self.tfr_prefix + '/' + str(np.max(img.shape)) + '/' + str(aug_s) + '.png', augimg)
@@ -683,9 +697,9 @@ def create_from_images(tfrecord_dir, image_dir, shuffle, augmentation=False):
     if channels not in [1, 3]:
         error('Input images must be stored as RGB or grayscale')
 
-    def do_image(idx, lod, return_dict):
+    def do_image(idx, lod, return_dict, fft_dict):
         img = np.asarray(PIL.Image.open(image_filenames[order[idx]]))
-        cache = tfr.add_image(img, lod, augmentation)
+        cache = tfr.add_image(img, lod, augmentation, fft_dict)
 
         return_dict[idx] = cache
 
@@ -695,11 +709,13 @@ def create_from_images(tfrecord_dir, image_dir, shuffle, augmentation=False):
 
         manager = multiprocessing.Manager()
         return_dict = manager.dict()
+        fft_dict = manager.dict()
 
         for lod in range(len(tfr.tfr_writers)):
             processes = []
+            fft_dict[0] = None
             for idx in range(order.size):
-                t = multiprocessing.Process(target=do_image, args=(idx, lod, return_dict))
+                t = multiprocessing.Process(target=do_image, args=(idx, lod, return_dict, fft_dict))
                 processes.append(t)
                 t.start()
 
@@ -851,7 +867,36 @@ def gkern(sigma=1.):
     return kernel / np.sum(kernel)
 
 
-def fftconvolve(in1, in2, mode="full", axes=None):
+def _inputs_swap_needed(mode, shape1, shape2):
+    """
+    If in 'valid' mode, returns whether or not the input arrays need to be
+    swapped depending on whether `shape1` is at least as large as `shape2` in
+    every dimension.
+    This is important for some of the correlation and convolution
+    implementations in this module, where the larger array input needs to come
+    before the smaller array input when operating in this mode.
+    Note that if the mode provided is not 'valid', False is immediately
+    returned.
+    """
+    if mode == 'valid':
+        ok1, ok2 = True, True
+
+        for d1, d2 in zip(shape1, shape2):
+            if not d1 >= d2:
+                ok1 = False
+            if not d2 >= d1:
+                ok2 = False
+
+        if not (ok1 or ok2):
+            raise ValueError("For 'valid' mode, one must be at least "
+                             "as large as the other in every dimension")
+
+        return not ok1
+
+    return False
+
+_rfft_mt_safe = (NumpyVersion(np.__version__) >= '1.9.0.dev-e24486e')
+def fftconvolve(in1, in2, fft_dict, mode="full", axes=None):
     """Convolve two N-dimensional arrays using FFT.
     Convolve `in1` and `in2` using the fast Fourier transform method, with
     the output size determined by the `mode` argument.
@@ -922,6 +967,7 @@ def fftconvolve(in1, in2, mode="full", axes=None):
     >>> ax_blurred.set_axis_off()
     >>> fig.show()
     """
+
     in1 = asarray(in1)
     in2 = asarray(in2)
     noaxes = axes is None
@@ -969,7 +1015,12 @@ def fftconvolve(in1, in2, mode="full", axes=None):
     if not complex_result and (_rfft_mt_safe or _rfft_lock.acquire(False)):
         try:
             sp1 = cupy.fft.rfftn(in1, fshape, axes=axes)
-            sp2 = cupy.fft.rfftn(in2, fshape, axes=axes)
+
+            if fft_dict[0] is None:
+                sp2 = cupy.fft.rfftn(in2, fshape, axes=axes)
+                fft_dict[0] = sp2
+            else:
+                sp2 = fft_dict[0]
             ret = cupy.fft.irfftn(sp1 * sp2, fshape, axes=axes)[fslice].copy()
         finally:
             if not _rfft_mt_safe:
@@ -999,7 +1050,7 @@ def fftconvolve(in1, in2, mode="full", axes=None):
                          " 'same', or 'full'")
 
 
-def elastic_transform(image, alpha, sigma, random_state=None):
+def elastic_transform(image, alpha, sigma, fft_dict, random_state=None):
         """Elastic deformation of images as described in [Simard2003]_ (with modifications).
         .. [Simard2003] Simard, Steinkraus and Platt, "Best Practices for
              Convolutional Neural Networks applied to Visual Document Analysis", in
@@ -1017,8 +1068,8 @@ def elastic_transform(image, alpha, sigma, random_state=None):
 
         kernel = gkern(sigma)
 
-        dx = scipy.signal.fftconvolve((random_state.rand(*shape) * 2 - 1), kernel, mode='same') * alpha
-        dy = scipy.signal.fftconvolve((random_state.rand(*shape) * 2 - 1), kernel, mode='same') * alpha
+        dx = scipy.signal.fftconvolve((random_state.rand(*shape) * 2 - 1), kernel, fft_dict, mode='same') * alpha
+        dy = scipy.signal.fftconvolve((random_state.rand(*shape) * 2 - 1), kernel, fft_dict, mode='same') * alpha
 
         dx = np.round(dx).astype(int)
         dy = np.round(dy).astype(int)
@@ -1056,21 +1107,21 @@ def dummy_transform(image):
 
 #----------------------------------------------------------------------------
 
-def elastic_steps(img, lod, random_state=None):
+def elastic_steps(img, lod, fft_dict, random_state=None):
     if lod == 0:
-        img = elastic_transform(img, np.max(img.shape) * 4, np.max(img.shape) * 0.06, random_state=random_state)
+        img = elastic_transform(img, np.max(img.shape) * 4, np.max(img.shape) * 0.06, fft_dict, random_state=random_state)
     elif lod == 1:
-        img = elastic_transform(img, np.max(img.shape) * 8, np.max(img.shape) * 0.1, random_state=random_state)
+        img = elastic_transform(img, np.max(img.shape) * 8, np.max(img.shape) * 0.1, fft_dict, random_state=random_state)
     elif lod == 2:
-        img = elastic_transform(img, np.max(img.shape) * 16, np.max(img.shape) * 0.15, random_state=random_state)
+        img = elastic_transform(img, np.max(img.shape) * 16, np.max(img.shape) * 0.15, fft_dict, random_state=random_state)
     elif lod == 3:
-        img = elastic_transform(img, np.max(img.shape) * 32, np.max(img.shape) * 0.2, random_state=random_state)
+        img = elastic_transform(img, np.max(img.shape) * 32, np.max(img.shape) * 0.2, fft_dict, random_state=random_state)
     elif lod == 4:
-        img = elastic_transform(img, np.max(img.shape) * 64, np.max(img.shape) * 0.3, random_state=random_state)
+        img = elastic_transform(img, np.max(img.shape) * 64, np.max(img.shape) * 0.3, fft_dict, random_state=random_state)
     elif lod == 5:
-        img = elastic_transform(img, np.max(img.shape) * 128, np.max(img.shape) * 0.4, random_state=random_state)
+        img = elastic_transform(img, np.max(img.shape) * 128, np.max(img.shape) * 0.4, fft_dict, random_state=random_state)
     elif lod == 6:
-        img = elastic_transform(img, np.max(img.shape) * 256, np.max(img.shape) * 0.5, random_state=random_state)
+        img = elastic_transform(img, np.max(img.shape) * 256, np.max(img.shape) * 0.5, fft_dict, random_state=random_state)
     elif lod ==7:
         #img = elastic_transform(img, np.max(img.shape) * 1, np.max(img.shape) * 0.003, random_state=random_state)
         img = dummy_transform(img)
