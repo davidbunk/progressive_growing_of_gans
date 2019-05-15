@@ -64,6 +64,9 @@ def convert_to_pil_image(image, drange=[0,1]):
     if image.ndim == 3:
         if image.shape[0] == 1:
             image = image[0] # grayscale CHW => HW
+        elif image.shape[0] == 2:
+            image = np.concatenate([image, np.zeros((1, image.shape[1], image.shape[2]))], axis=0)
+            image = image.transpose(1, 2, 0) # CHW -> HWC
         else:
             image = image.transpose(1, 2, 0) # CHW -> HWC
 
