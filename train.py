@@ -92,10 +92,10 @@ class TrainingSchedule:
             self,
             cur_nimg,
             training_set,
-            lod_initial_resolution  = 8,        # Image resolution used at the beginning.
-            lod_training_kimg       = 600,      # Thousands of real images to show before doubling the resolution.
+            lod_initial_resolution  = 16,        # Image resolution used at the beginning.
+            lod_training_kimg       = 1500,      # Thousands of real images to show before doubling the resolution.
             lod_transition_kimg     = 600,      # Thousands of real images to show when fading in new layers.
-            minibatch_base          = 1,       # Maximum minibatch size, divided evenly among GPUs.
+            minibatch_base          = 16,       # Maximum minibatch size, divided evenly among GPUs.
             minibatch_dict          = {},       # Resolution-specific overrides.
             max_minibatch_per_gpu   = {},       # Resolution-specific maximum minibatch size per GPU.
             G_lrate_base            = 0.001,    # Learning rate for the generator.
@@ -140,7 +140,7 @@ def train_progressive_gan(
         D_repeats               = 10,            # How many times the discriminator is trained per phase 1 G iteration.
         D_2_repeats               = 10,            # How many times the discriminator is trained per phase 2 G iteration.
         minibatch_repeats       = 4,            # Number of minibatches to run in phase 1 before adjusting training parameters.
-        minibatch_2_repeats       = 4,            # Number of minibatches to run in phase 2before adjusting training parameters.
+        minibatch_2_repeats       = 4,            # Number of minibatches to run in phase 2 before adjusting training parameters.
         reset_opt_for_new_lod   = True,         # Reset optimizer internal state (e.g. Adam moments) when new layers are introduced?
         total_kimg              = 15000,        # Total length of the training, measured in thousands of real images.
         mirror_augment          = True,        # Enable mirror augment?
@@ -174,8 +174,8 @@ def train_progressive_gan(
             Gs = G.clone('Gs')
 
             # Phase 2
-            G_2 = tfutil.Network('G_2',  num_channels=training_set_2.shape[0], resolution=training_set_2.shape[1], label_size=training_set_2.label_size, **config.G_2)
-            D_2 = tfutil.Network('D_2', num_channels=training_set_2.shape[0], resolution=training_set_2.shape[1], label_size=training_set_2.label_size, **config.D_2)
+            G_2 = tfutil.Network('G_2',  num_channels=training_set_2.shape[0], num_mask_channels=training_set.shape[0], resolution=training_set_2.shape[1], label_size=training_set_2.label_size, **config.G_2)
+            D_2 = tfutil.Network('D_2', num_channels=training_set_2.shape[0], num_mask_channels=training_set.shape[0], resolution=training_set_2.shape[1], label_size=training_set_2.label_size, **config.D_2)
             Gs_2 = G_2.clone('Gs_2')
 
         Gs_update_op = Gs.setup_as_moving_average_of(G, beta=G_smoothing)
@@ -206,8 +206,8 @@ def train_progressive_gan(
     D_opt = tfutil.Optimizer(name='TrainD', learning_rate=lrate_in, **config.D_opt)
 
     # Phase 2 optimizers.
-    G_2_opt = tfutil.Optimizer(name='TrainG_2', learning_rate=0.0001, **config.G_2_opt)
-    D_2_opt = tfutil.Optimizer(name='TrainD_2', learning_rate=0.0004, **config.D_2_opt)
+    #G_2_opt = tfutil.Optimizer(name='TrainG_2', learning_rate=0.0001, **config.G_2_opt)
+    D_2_opt = tfutil.Optimizer(name='TrainD_2', learning_rate=0.001, **config.D_2_opt)
 
     for gpu in range(config.num_gpus):
         with tf.name_scope('GPU%d' % gpu), tf.device('/gpu:%d' % gpu):
@@ -238,16 +238,16 @@ def train_progressive_gan(
 
             # Phase 2
             with tf.name_scope('G_2_loss'), tf.control_dependencies(lod_assign_ops_2):
-                G_2_loss = tfutil.call_func_by_name(G=G_2_gpu, D=D_2_gpu, opt=G_2_opt, training_set=training_set_2, minibatch_size=minibatch_split, G_old=G_gpu, training_set_old=training_set, **config.G_2_loss)
+                G_2_loss = tfutil.call_func_by_name(G=G_2_gpu, D=D_2_gpu, opt=G_opt, training_set=training_set_2, minibatch_size=minibatch_split, G_old=G_gpu, training_set_old=training_set, **config.G_2_loss)
             with tf.name_scope('D_2_loss'), tf.control_dependencies(lod_assign_ops_2):
                 D_2_loss = tfutil.call_func_by_name(G=G_2_gpu, D=D_2_gpu, opt=D_2_opt, training_set=training_set_2, minibatch_size=minibatch_split, reals=reals_2_gpu, labels=labels_2_gpu, G_old=G_gpu, training_set_old=training_set, **config.D_2_loss)
 
             # Phase 1
-            G_opt.register_gradients(tf.reduce_mean(G_loss), G_gpu.trainables)
+            G_opt.register_gradients(tf.reduce_mean(G_loss) + tf.reduce_mean(G_2_loss), list(G_gpu.trainables.values()) + list(G_2_gpu.trainables.values()))
             D_opt.register_gradients(tf.reduce_mean(D_loss), D_gpu.trainables)
 
             # Phase 2
-            G_2_opt.register_gradients(tf.reduce_mean(G_2_loss), G_2_gpu.trainables)
+            #G_2_opt.register_gradients(tf.reduce_mean(G_2_loss), G_2_gpu.trainables)
             D_2_opt.register_gradients(tf.reduce_mean(D_2_loss), D_2_gpu.trainables)
 
     # Phase 1
@@ -255,7 +255,7 @@ def train_progressive_gan(
     D_train_op = D_opt.apply_updates()
 
     # Phase 2
-    G_2_train_op = G_2_opt.apply_updates()
+    #G_2_train_op = G_2_opt.apply_updates()
     D_2_train_op = D_2_opt.apply_updates()
 
     print('Setting up snapshot image grid...')
@@ -309,7 +309,8 @@ def train_progressive_gan(
                 # Phase 1
                 G_opt.reset_optimizer_state(); D_opt.reset_optimizer_state()
                 # Phase 2
-                G_2_opt.reset_optimizer_state(); D_2_opt.reset_optimizer_state()
+                #G_2_opt.reset_optimizer_state(); D_2_opt.reset_optimizer_state()
+                D_2_opt.reset_optimizer_state()
         prev_lod = sched.lod
 
         # Run training ops.
@@ -320,7 +321,7 @@ def train_progressive_gan(
                 tfutil.run([D_2_train_op, Gs_2_update_op], {lod_in: sched_2.lod, lrate_in: sched_2.D_lrate, minibatch_in: sched_2.minibatch})
                 cur_nimg += sched_2.minibatch
             tfutil.run([G_train_op], {lod_in: sched.lod, lrate_in: sched.G_lrate, minibatch_in: sched.minibatch})
-            tfutil.run([G_2_train_op], {lod_in: sched_2.lod, lrate_in: sched_2.G_lrate, minibatch_in: sched_2.minibatch})
+            #tfutil.run([G_2_train_op], {lod_in: sched_2.lod, lrate_in: sched_2.G_lrate, minibatch_in: sched_2.minibatch})
             # for duck in range(1):
             #     for quack in range(D_2_repeats):
             #         tfutil.run([D_2_train_op, Gs_2_update_op], {lod_in: sched_2.lod, lrate_in: sched_2.D_lrate, minibatch_in: sched_2.minibatch})

@@ -56,8 +56,8 @@ sched     = EasyDict()                                    # Options for train.Tr
 grid        = EasyDict(size='1080p', layout='random')       # Options for train.setup_snapshot_image_grid().
 
 # Dataset (choose one).
-desc += '-labels';            dataset = EasyDict(tfrecord_dir='/scratch/guirao/datasets/EM_tfrec/', resolution=1024); train.mirror_augment = True
-desc += '-reals';             dataset_2 = EasyDict(tfrecord_dir='/scratch/guirao/datasets/EM_real_tfrec/', resolution=1024); train.mirror_augment = True
+desc += '-labels';            dataset = EasyDict(tfrecord_dir='/scratch/bunk/datasets/tfrecords/EM_labels_15/', resolution=1024); train.mirror_augment = True
+desc += '-reals';             dataset_2 = EasyDict(tfrecord_dir='/scratch/bunk/datasets/tfrecords/EM_reals_15/', resolution=1024); train.mirror_augment = True
 #desc += '-celebahq';            dataset = EasyDict(tfrecord_dir='celebahq'); train.mirror_augment = True
 #desc += '-celeba';              dataset = EasyDict(tfrecord_dir='celeba'); train.mirror_augment = True
 #desc += '-cifar10';             dataset = EasyDict(tfrecord_dir='cifar10')
