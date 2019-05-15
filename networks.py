@@ -384,6 +384,7 @@ def G_phase2(
         labels_in,                          # Second input: Labels [minibatch, label_size].
         mask,                                # Third input: Masks
         num_channels        = 1,            # Number of output color channels. Overridden based on dataset.
+        num_mask_channels = 1,          # Number of input mask channels. Overridden based on dataset.
         resolution          = 32,           # Output resolution. Overridden based on dataset.
         label_size          = 0,            # Dimensionality of the labels, 0 if no labels. Overridden based on dataset.
         fmap_base           = 8192,         # Overall multiplier for the number of feature maps.
@@ -411,7 +412,7 @@ def G_phase2(
 
     latents_in.set_shape([None, latent_size])
     labels_in.set_shape([None, label_size])
-    mask.set_shape([None, 1, None, None])
+    mask.set_shape([None, num_mask_channels, None, None])
 
     # COMMENT TOOK LABELS OUT
     #combo_in = tf.cast(tf.concat([latents_in, labels_in], axis=1), dtype)
@@ -419,9 +420,10 @@ def G_phase2(
     lod_in = tf.cast(tf.get_variable('lod', initializer=np.float32(0.0), trainable=False), dtype)
 
     def resize_mask(mask, res):
-        #mask = downscale2d(mask, res)
-        for idx in range(res):
-            mask = mask[:, :, 0::2, 0::2]
+        if res > 0:
+            mask = downscale2d(mask, 2**res)
+        # for idx in range(res):
+        #     mask = mask[:, :, 0::2, 0::2]
         return mask
 
     def spade(x, label, res, first=False):
