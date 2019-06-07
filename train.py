@@ -206,8 +206,8 @@ def train_progressive_gan(
     D_opt = tfutil.Optimizer(name='TrainD', learning_rate=lrate_in, **config.D_opt)
 
     # Phase 2 optimizers.
-    #G_2_opt = tfutil.Optimizer(name='TrainG_2', learning_rate=0.0001, **config.G_2_opt)
-    D_2_opt = tfutil.Optimizer(name='TrainD_2', learning_rate=0.001, **config.D_2_opt)
+    G_2_opt = tfutil.Optimizer(name='TrainG_2', learning_rate=lrate_in, **config.G_2_opt)
+    D_2_opt = tfutil.Optimizer(name='TrainD_2', learning_rate=lrate_in, **config.D_2_opt)
 
     for gpu in range(config.num_gpus):
         with tf.name_scope('GPU%d' % gpu), tf.device('/gpu:%d' % gpu):
@@ -243,11 +243,11 @@ def train_progressive_gan(
                 D_2_loss = tfutil.call_func_by_name(G=G_2_gpu, D=D_2_gpu, opt=D_2_opt, training_set=training_set_2, minibatch_size=minibatch_split, reals=reals_2_gpu, labels=labels_2_gpu, G_old=G_gpu, training_set_old=training_set, **config.D_2_loss)
 
             # Phase 1
-            G_opt.register_gradients(tf.reduce_mean(G_loss) + tf.reduce_mean(G_2_loss), list(G_gpu.trainables.values()) + list(G_2_gpu.trainables.values()))
+            G_opt.register_gradients(tf.reduce_mean(G_loss), G_gpu.trainables)
             D_opt.register_gradients(tf.reduce_mean(D_loss), D_gpu.trainables)
 
             # Phase 2
-            #G_2_opt.register_gradients(tf.reduce_mean(G_2_loss), G_2_gpu.trainables)
+            G_2_opt.register_gradients(tf.reduce_mean(G_2_loss), G_2_gpu.trainables)
             D_2_opt.register_gradients(tf.reduce_mean(D_2_loss), D_2_gpu.trainables)
 
     # Phase 1
@@ -255,7 +255,7 @@ def train_progressive_gan(
     D_train_op = D_opt.apply_updates()
 
     # Phase 2
-    #G_2_train_op = G_2_opt.apply_updates()
+    G_2_train_op = G_2_opt.apply_updates()
     D_2_train_op = D_2_opt.apply_updates()
 
     print('Setting up snapshot image grid...')
@@ -302,15 +302,14 @@ def train_progressive_gan(
 
         # Phase 2
         sched_2 = TrainingSchedule(cur_nimg, training_set_2, **config.sched)
-        training_set_2.configure(sched_2.minibatch, sched_2.lod)
+        training_set_2.configure(sched_2.minibatch, schede_2.lod)
 
         if reset_opt_for_new_lod:
             if np.floor(sched.lod) != np.floor(prev_lod) or np.ceil(sched.lod) != np.ceil(prev_lod):
                 # Phase 1
                 G_opt.reset_optimizer_state(); D_opt.reset_optimizer_state()
                 # Phase 2
-                #G_2_opt.reset_optimizer_state(); D_2_opt.reset_optimizer_state()
-                D_2_opt.reset_optimizer_state()
+                G_2_opt.reset_optimizer_state(); D_2_opt.reset_optimizer_state()
         prev_lod = sched.lod
 
         # Run training ops.
@@ -321,7 +320,7 @@ def train_progressive_gan(
                 tfutil.run([D_2_train_op, Gs_2_update_op], {lod_in: sched_2.lod, lrate_in: sched_2.D_lrate, minibatch_in: sched_2.minibatch})
                 cur_nimg += sched_2.minibatch
             tfutil.run([G_train_op], {lod_in: sched.lod, lrate_in: sched.G_lrate, minibatch_in: sched.minibatch})
-            #tfutil.run([G_2_train_op], {lod_in: sched_2.lod, lrate_in: sched_2.G_lrate, minibatch_in: sched_2.minibatch})
+            tfutil.run([G_2_train_op], {lod_in: sched_2.lod, lrate_in: sched_2.G_lrate, minibatch_in: sched_2.minibatch})
             # for duck in range(1):
             #     for quack in range(D_2_repeats):
             #         tfutil.run([D_2_train_op, Gs_2_update_op], {lod_in: sched_2.lod, lrate_in: sched_2.D_lrate, minibatch_in: sched_2.minibatch})
@@ -364,7 +363,7 @@ def train_progressive_gan(
                 # Phase 1
                 grid_fakes = Gs.run(grid_latents, grid_labels, minibatch_size=sched.minibatch//config.num_gpus)
                 misc.save_image_grid(grid_fakes, os.path.join(result_subdir, 'fake_labels%06d.png' % (cur_nimg // 1000)), drange=drange_net, grid_size=grid_size)
-                grid_fakes = rescale_intensity(grid_fakes, out_range=(1, 3))
+                #grid_fakes = rescale_intensity(grid_fakes, out_range=(1, 3))
                 # Phase 2
                 grid_fakes_2 = Gs_2.run(grid_latents_2, grid_labels_2, grid_fakes, minibatch_size=sched_2.minibatch//config.num_gpus)
                 misc.save_image_grid(grid_fakes_2, os.path.join(result_subdir, 'fake_images%06d.png' % (cur_nimg // 1000)), drange=drange_net, grid_size=grid_size_2)
