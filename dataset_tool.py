@@ -16,6 +16,7 @@ import numpy as np
 import tensorflow as tf
 import PIL.Image
 import copy
+import os
 
 import math
 import warnings
@@ -43,6 +44,30 @@ from skimage.io import imsave
 from skimage.transform import resize
 import multiprocessing
 from numba import jit, njit
+
+os.environ['CUDA_VISIBLE_DEVICES'] = '2'
+
+
+def random_crop(img, size, order='HWC'):
+    if order not in ('CHW', 'HWC'):
+        raise ValueError('order needs to be "CHW" or "HWC"')
+    start = np.zeros(len(img.shape), dtype=np.int)
+    end = np.zeros(len(img.shape), dtype=np.int)
+    for i in range(len(img.shape) - 1):
+        i2 = (i + 1) if order == 'CHW' else i
+
+        start[i2] = np.round(np.random.uniform() * (img.shape[i2] - size[i])).astype(np.int)
+        end[i2] = start[i2] + size[i]
+
+    if order == 'CHW':
+        start[0] = 0
+        end[0] = img.shape[0]
+    elif order == 'HWC':
+        start[2] = 0
+        end[2] = img.shape[2]
+
+    slices = [slice(s, e) for s, e in zip(start, end)]
+    return img[tuple(slices)]
 
 #----------------------------------------------------------------------------
 
@@ -135,6 +160,10 @@ class TFRecordExporter:
                         augimg = augimg[0::2,0::2, :]  # + img[:, 0::2, 1::2] + img[:, 1::2, 0::2] + img[:, 1::2, 1::2]) * 0.25
                     else:
                         augimg = resize(augimg, (1024/2**lod, 1024/2**lod), order=3, clip=False, anti_aliasing=True, preserve_range=True)
+
+                print(augimg.shape)
+                augimg = random_crop(augimg, (512/2**lod, 512/2**lod))
+                print(augimg.shape)
 
                 # if len(augimg.shape) == 2:
                 #     augimg = augimg[np.newaxis, :, :] # HW => CHW
@@ -1112,9 +1141,11 @@ def dummy_transform(image):
 
 def elastic_steps(img, lod, random_state=None):
     if lod == 0:
-        img = elastic_transform(img, np.max(img.shape) * 4, np.max(img.shape) * 0.06, random_state=random_state)
+        img = dummy_transform(img)
+        #img = elastic_transform(img, np.max(img.shape) * 4, np.max(img.shape) * 0.06, random_state=random_state)
     elif lod == 1:
-        img = elastic_transform(img, np.max(img.shape) * 8, np.max(img.shape) * 0.1, random_state=random_state)
+        img = dummy_transform(img)
+        #img = elastic_transform(img, np.max(img.shape) * 8, np.max(img.shape) * 0.1, random_state=random_state)
     elif lod == 2:
         img = elastic_transform(img, np.max(img.shape) * 16, np.max(img.shape) * 0.15, random_state=random_state)
     elif lod == 3:

@@ -15,6 +15,16 @@ from collections import OrderedDict
 import tensorflow as tf
 from tensorflow.python.ops import nccl_ops
 
+from tensorflow.python.eager import context
+from tensorflow.python.framework import ops
+from tensorflow.python.ops import control_flow_ops
+from tensorflow.python.ops import math_ops
+from tensorflow.python.ops import resource_variable_ops
+from tensorflow.python.ops import state_ops
+from tensorflow.python.ops import variable_scope
+from tensorflow.python.training import optimizer
+from tensorflow.python.ops.clip_ops import clip_by_value
+
 #----------------------------------------------------------------------------
 # Convenience.
 
@@ -244,6 +254,227 @@ def call_func_by_name(*args, func=None, **kwargs):
 # - Reporting statistics.
 # - Well-chosen default settings.
 
+
+class AdaBoundOptimizer(optimizer.Optimizer):
+    def __init__(self, learning_rate=0.0005, final_lr=0.002, beta1=0, beta2=0.999,
+                 gamma=1e-3, epsilon=1e-8, amsbound=False,
+                 use_locking=False, name="AdaBound"):
+        super(AdaBoundOptimizer, self).__init__(use_locking, name)
+        self._lr = learning_rate
+        self._final_lr = final_lr
+        self._beta1 = beta1
+        self._beta2 = beta2
+        self._epsilon = epsilon
+
+        self._gamma = gamma
+        self._amsbound = amsbound
+
+        self._lr_t = None
+        self._beta1_t = None
+        self._beta2_t = None
+        self._epsilon_t = None
+
+    def _create_slots(self, var_list):
+        first_var = min(var_list, key=lambda x: x.name)
+
+        graph = None if context.executing_eagerly() else ops.get_default_graph()
+        create_new = self._get_non_slot_variable("beta1_power", graph) is None
+        if not create_new and context.in_graph_mode():
+            create_new = (self._get_non_slot_variable("beta1_power", graph).graph is not first_var.graph)
+
+        if create_new:
+            self._create_non_slot_variable(initial_value=self._beta1,
+                                           name="beta1_power",
+                                           colocate_with=first_var)
+            self._create_non_slot_variable(initial_value=self._beta2,
+                                           name="beta2_power",
+                                           colocate_with=first_var)
+            self._create_non_slot_variable(initial_value=self._gamma,
+                                           name="gamma_multi",
+                                           colocate_with=first_var)
+        # Create slots for the first and second moments.
+        for v in var_list :
+            self._zeros_slot(v, "m", self._name)
+            self._zeros_slot(v, "v", self._name)
+            self._zeros_slot(v, "vhat", self._name)
+
+
+    def _prepare(self):
+        self._lr_t = ops.convert_to_tensor(self._lr)
+        self._base_lr_t = ops.convert_to_tensor(self._lr)
+        self._beta1_t = ops.convert_to_tensor(self._beta1)
+        self._beta2_t = ops.convert_to_tensor(self._beta2)
+        self._epsilon_t = ops.convert_to_tensor(self._epsilon)
+        self._gamma_t = ops.convert_to_tensor(self._gamma)
+
+    def _apply_dense(self, grad, var):
+        graph = None if context.executing_eagerly() else ops.get_default_graph()
+        beta1_power = math_ops.cast(self._get_non_slot_variable("beta1_power", graph=graph), var.dtype.base_dtype)
+        beta2_power = math_ops.cast(self._get_non_slot_variable("beta2_power", graph=graph), var.dtype.base_dtype)
+        lr_t = math_ops.cast(self._lr_t, var.dtype.base_dtype)
+        base_lr_t = math_ops.cast(self._base_lr_t, var.dtype.base_dtype)
+        beta1_t = math_ops.cast(self._beta1_t, var.dtype.base_dtype)
+        beta2_t = math_ops.cast(self._beta2_t, var.dtype.base_dtype)
+        epsilon_t = math_ops.cast(self._epsilon_t, var.dtype.base_dtype)
+        gamma_multi = math_ops.cast(self._get_non_slot_variable("gamma_multi", graph=graph), var.dtype.base_dtype)
+
+        step_size = (lr_t * math_ops.sqrt(1 - beta2_power) / (1 - beta1_power))
+        final_lr = self._final_lr * lr_t / base_lr_t
+        lower_bound = final_lr * (1. - 1. / (gamma_multi + 1.))
+        upper_bound = final_lr * (1. + 1. / (gamma_multi))
+
+        # m_t = beta1 * m + (1 - beta1) * g_t
+        m = self.get_slot(var, "m")
+        m_scaled_g_values = grad * (1 - beta1_t)
+        m_t = state_ops.assign(m, beta1_t * m + m_scaled_g_values, use_locking=self._use_locking)
+
+        # v_t = beta2 * v + (1 - beta2) * (g_t * g_t)
+        v = self.get_slot(var, "v")
+        v_scaled_g_values = (grad * grad) * (1 - beta2_t)
+        v_t = state_ops.assign(v, beta2_t * v + v_scaled_g_values, use_locking=self._use_locking)
+
+        # amsgrad
+        vhat = self.get_slot(var, "vhat")
+        if self._amsbound :
+            vhat_t = state_ops.assign(vhat, math_ops.maximum(v_t, vhat))
+            v_sqrt = math_ops.sqrt(vhat_t)
+        else :
+            vhat_t = state_ops.assign(vhat, vhat)
+            v_sqrt = math_ops.sqrt(v_t)
+
+
+        # Compute the bounds
+        step_size_bound = step_size / (v_sqrt + epsilon_t)
+        bounded_lr = m_t * clip_by_value(step_size_bound, lower_bound, upper_bound)
+
+        var_update = state_ops.assign_sub(var, bounded_lr, use_locking=self._use_locking)
+        return control_flow_ops.group(*[var_update, m_t, v_t, vhat_t])
+
+    def _resource_apply_dense(self, grad, var):
+        graph = None if context.executing_eagerly() else ops.get_default_graph()
+        beta1_power = math_ops.cast(self._get_non_slot_variable("beta1_power", graph=graph), grad.dtype.base_dtype)
+        beta2_power = math_ops.cast(self._get_non_slot_variable("beta2_power", graph=graph), grad.dtype.base_dtype)
+        lr_t = math_ops.cast(self._lr_t, grad.dtype.base_dtype)
+        base_lr_t = math_ops.cast(self._base_lr_t, var.dtype.base_dtype)
+        beta1_t = math_ops.cast(self._beta1_t, grad.dtype.base_dtype)
+        beta2_t = math_ops.cast(self._beta2_t, grad.dtype.base_dtype)
+        epsilon_t = math_ops.cast(self._epsilon_t, grad.dtype.base_dtype)
+        gamma_multi = math_ops.cast(self._get_non_slot_variable("gamma_multi", graph=graph), var.dtype.base_dtype)
+
+        step_size = (lr_t * math_ops.sqrt(1 - beta2_power) / (1 - beta1_power))
+        final_lr = self._final_lr * lr_t / base_lr_t
+        lower_bound = final_lr * (1. - 1. / (gamma_multi + 1.))
+        upper_bound = final_lr * (1. + 1. / (gamma_multi))
+
+        # m_t = beta1 * m + (1 - beta1) * g_t
+        m = self.get_slot(var, "m")
+        m_scaled_g_values = grad * (1 - beta1_t)
+        m_t = state_ops.assign(m, beta1_t * m + m_scaled_g_values, use_locking=self._use_locking)
+
+        # v_t = beta2 * v + (1 - beta2) * (g_t * g_t)
+        v = self.get_slot(var, "v")
+        v_scaled_g_values = (grad * grad) * (1 - beta2_t)
+        v_t = state_ops.assign(v, beta2_t * v + v_scaled_g_values, use_locking=self._use_locking)
+
+        # amsgrad
+        vhat = self.get_slot(var, "vhat")
+        if self._amsbound:
+            vhat_t = state_ops.assign(vhat, math_ops.maximum(v_t, vhat))
+            v_sqrt = math_ops.sqrt(vhat_t)
+        else:
+            vhat_t = state_ops.assign(vhat, vhat)
+            v_sqrt = math_ops.sqrt(v_t)
+
+        # Compute the bounds
+        step_size_bound = step_size / (v_sqrt + epsilon_t)
+        bounded_lr = m_t * clip_by_value(step_size_bound, lower_bound, upper_bound)
+
+        var_update = state_ops.assign_sub(var, bounded_lr, use_locking=self._use_locking)
+
+        return control_flow_ops.group(*[var_update, m_t, v_t, vhat_t])
+
+    def _apply_sparse_shared(self, grad, var, indices, scatter_add):
+        graph = None if context.executing_eagerly() else ops.get_default_graph()
+        beta1_power = math_ops.cast(self._get_non_slot_variable("beta1_power", graph=graph), var.dtype.base_dtype)
+        beta2_power = math_ops.cast(self._get_non_slot_variable("beta2_power", graph=graph), var.dtype.base_dtype)
+        lr_t = math_ops.cast(self._lr_t, var.dtype.base_dtype)
+        base_lr_t = math_ops.cast(self._base_lr_t, var.dtype.base_dtype)
+        beta1_t = math_ops.cast(self._beta1_t, var.dtype.base_dtype)
+        beta2_t = math_ops.cast(self._beta2_t, var.dtype.base_dtype)
+        epsilon_t = math_ops.cast(self._epsilon_t, var.dtype.base_dtype)
+        gamma_t = math_ops.cast(self._gamma_t, var.dtype.base_dtype)
+
+        step_size = (lr_t * math_ops.sqrt(1 - beta2_power) / (1 - beta1_power))
+        final_lr = self._final_lr * lr_t / base_lr_t
+        lower_bound = final_lr * (1. - 1. / (gamma_t + 1.))
+        upper_bound = final_lr * (1. + 1. / (gamma_t))
+
+        # m_t = beta1 * m + (1 - beta1) * g_t
+        m = self.get_slot(var, "m")
+        m_scaled_g_values = grad * (1 - beta1_t)
+        m_t = state_ops.assign(m, m * beta1_t, use_locking=self._use_locking)
+        with ops.control_dependencies([m_t]):
+            m_t = scatter_add(m, indices, m_scaled_g_values)
+
+        # v_t = beta2 * v + (1 - beta2) * (g_t * g_t)
+        v = self.get_slot(var, "v")
+        v_scaled_g_values = (grad * grad) * (1 - beta2_t)
+        v_t = state_ops.assign(v, v * beta2_t, use_locking=self._use_locking)
+        with ops.control_dependencies([v_t]):
+            v_t = scatter_add(v, indices, v_scaled_g_values)
+
+        # amsgrad
+        vhat = self.get_slot(var, "vhat")
+        if self._amsbound:
+            vhat_t = state_ops.assign(vhat, math_ops.maximum(v_t, vhat))
+            v_sqrt = math_ops.sqrt(vhat_t)
+        else:
+            vhat_t = state_ops.assign(vhat, vhat)
+            v_sqrt = math_ops.sqrt(v_t)
+
+        # Compute the bounds
+        step_size_bound = step_size / (v_sqrt + epsilon_t)
+        bounded_lr = m_t * clip_by_value(step_size_bound, lower_bound, upper_bound)
+
+        var_update = state_ops.assign_sub(var, bounded_lr, use_locking=self._use_locking)
+
+        return control_flow_ops.group(*[var_update, m_t, v_t, vhat_t])
+
+    def _apply_sparse(self, grad, var):
+        return self._apply_sparse_shared(
+            grad.values, var, grad.indices,
+            lambda x, i, v: state_ops.scatter_add(  # pylint: disable=g-long-lambda
+                x, i, v, use_locking=self._use_locking))
+
+    def _resource_scatter_add(self, x, i, v):
+        with ops.control_dependencies(
+                [resource_variable_ops.resource_scatter_add(x, i, v)]):
+            return x.value()
+
+    def _resource_apply_sparse(self, grad, var, indices):
+        return self._apply_sparse_shared(
+            grad, var, indices, self._resource_scatter_add)
+
+    def _finish(self, update_ops, name_scope):
+        # Update the power accumulators.
+        with ops.control_dependencies(update_ops):
+            graph = None if context.executing_eagerly() else ops.get_default_graph()
+            beta1_power = self._get_non_slot_variable("beta1_power", graph=graph)
+            beta2_power = self._get_non_slot_variable("beta2_power", graph=graph)
+            gamma_multi = self._get_non_slot_variable("gamma_multi", graph=graph)
+            with ops.colocate_with(beta1_power):
+                update_beta1 = beta1_power.assign(
+                    beta1_power * self._beta1_t,
+                    use_locking=self._use_locking)
+                update_beta2 = beta2_power.assign(
+                    beta2_power * self._beta2_t,
+                    use_locking=self._use_locking)
+                update_gamma = gamma_multi.assign(
+                    gamma_multi + self._gamma_t,
+                    use_locking=self._use_locking)
+        return control_flow_ops.group(*update_ops + [update_beta1, update_beta2, update_gamma],
+                                      name=name_scope)
+
 class Optimizer:
     def __init__(
         self,
@@ -261,7 +492,10 @@ class Optimizer:
         self.learning_rate      = tf.convert_to_tensor(learning_rate)
         self.id                 = self.name.replace('/', '.')
         self.scope              = tf.get_default_graph().unique_name(self.id)
-        self.optimizer_class    = import_obj(tf_optimizer)
+        if tf_optimizer == 'AdaBoundOptimizer':
+            self.optimizer_class = AdaBoundOptimizer
+        else:
+            self.optimizer_class    = import_obj(tf_optimizer)
         self.optimizer_kwargs   = dict(kwargs)
         self.use_loss_scaling   = use_loss_scaling
         self.loss_scaling_init  = loss_scaling_init
@@ -276,6 +510,7 @@ class Optimizer:
     # Register the gradients of the given loss function with respect to the given variables.
     # Intended to be called once per GPU.
     def register_gradients(self, loss, vars):
+        self._updates_applied   = False
         assert not self._updates_applied
 
         # Validate arguments.
@@ -283,8 +518,8 @@ class Optimizer:
             vars = list(vars.values()) # allow passing in Network.trainables as vars
         assert isinstance(vars, list) and len(vars) >= 1
         assert all(is_tf_expression(expr) for expr in vars + [loss])
-        if self._grad_shapes is None:
-            self._grad_shapes = [shape_to_list(var.shape) for var in vars]
+        #if self._grad_shapes is None:
+        self._grad_shapes = [shape_to_list(var.shape) for var in vars]
         assert len(vars) == len(self._grad_shapes)
         assert all(shape_to_list(var.shape) == var_shape for var, var_shape in zip(vars, self._grad_shapes))
         dev = loss.device
@@ -294,12 +529,15 @@ class Optimizer:
         with tf.name_scope(self.id + '_grad'), tf.device(dev):
             if dev not in self._dev_opt:
                 opt_name = self.scope.replace('/', '_') + '_opt%d' % len(self._dev_opt)
-                self._dev_opt[dev] = self.optimizer_class(name=opt_name, learning_rate=self.learning_rate, **self.optimizer_kwargs)
+                self._dev_opt[dev] = self.optimizer_class(self.learning_rate, **self.optimizer_kwargs)
                 self._dev_grads[dev] = []
             loss = self.apply_loss_scaling(tf.cast(loss, tf.float32))
             grads = self._dev_opt[dev].compute_gradients(loss, vars, gate_gradients=tf.train.Optimizer.GATE_NONE) # disable gating to reduce memory usage
             grads = [(g, v) if g is not None else (tf.zeros_like(v), v) for g, v in grads] # replace disconnected gradients with zeros
-            self._dev_grads[dev].append(grads)
+            # self._dev_grads[dev].append(grads)
+
+            # for layer freezing
+            self._dev_grads[dev] = [grads]
 
     # Construct training op to update the registered variables based on their gradients.
     def apply_updates(self):
@@ -360,12 +598,12 @@ class Optimizer:
                                 lambda: tf.group(tf.assign_sub(ls_var, self.loss_scaling_dec))))
 
                     # Report statistics on the last device.
-                    if dev == devices[-1]:
-                        with tf.name_scope('Statistics'):
-                            ops.append(autosummary(self.id + '/learning_rate', self.learning_rate))
-                            ops.append(autosummary(self.id + '/overflow_frequency', tf.where(grad_ok, 0, 1)))
-                            if self.use_loss_scaling:
-                                ops.append(autosummary(self.id + '/loss_scaling_log2', ls_var))
+                    # if dev == devices[-1]:
+                    #     with tf.name_scope('Statistics'):
+                    #         ops.append(autosummary(self.id + '/learning_rate', self.learning_rate))
+                    #         ops.append(autosummary(self.id + '/overflow_frequency', tf.where(grad_ok, 0, 1)))
+                    #         if self.use_loss_scaling:
+                    #             ops.append(autosummary(self.id + '/loss_scaling_log2', ls_var))
 
             # Initialize variables and group everything into a single op.
             self.reset_optimizer_state()
@@ -628,6 +866,7 @@ class Network:
         out_add         = 0.0,      # Additive constant to apply to the output(s).
         out_shrink      = 1,        # Shrink the spatial dimensions of the output(s) by the given factor.
         out_dtype       = None,     # Convert the output to the specified data type.
+        crop = False,
         **dynamic_kwargs):          # Additional keyword arguments to pass into the network construction function.
 
         assert len(in_arrays) == self.num_inputs

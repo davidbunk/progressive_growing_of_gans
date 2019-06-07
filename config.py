@@ -43,7 +43,7 @@ train       = EasyDict(func='train.train_progressive_gan')  # Options for main t
 G           = EasyDict(func='networks.G_paper')             # Options for phase 1 generator network.
 D           = EasyDict(func='networks.D_paper')             # Options for phase 1 discriminator network.
 G_2        = EasyDict(func='networks.G_phase2')          # Options for phase 2 generator network.
-D_2        = EasyDict(func='networks.D_paper')             # Options for phase 2 discriminator network.
+D_2        = EasyDict(func='networks.D_2_paper')             # Options for phase 2 discriminator network.
 G_opt     = EasyDict(beta1=0.0, beta2=0.99, epsilon=1e-8) # Options for generator optimizer.
 G_2_opt  = EasyDict(beta1=0.0, beta2=0.99, epsilon=1e-8) # Options for generator optimizer.
 D_opt     = EasyDict(beta1=0.0, beta2=0.99, epsilon=1e-8) # Options for phase 1 discriminator optimizer.
@@ -134,8 +134,8 @@ desc += '-fp32'; sched.max_minibatch_per_gpu = {256: 16, 512: 8, 1024: 4}
 # Utility scripts.
 # To run, uncomment the appropriate line and launch train.py.
 
-#train = EasyDict(func='util_scripts.generate_fake_images', run_id=63, num_pngs=1000); num_gpus = 1; desc = 'fake-images-' + str(train.run_id)
-#train = EasyDict(func='util_scripts.generate_fake_images', run_id=23, grid_size=[15,8], num_pngs=10, image_shrink=4); num_gpus = 1; desc = 'fake-grids-' + str(train.run_id)
+#train = EasyDict(func='util_scripts.generate_fake_images', run_id=141, num_pngs=200, snapshot=8909); num_gpus = 1; desc = 'fake-images-' + str(train.run_id)
+#train = EasyDict(func='util_scripts.generate_fake_images', run_id=89, grid_size=[15,8], num_pngs=10, image_shrink=4); num_gpus = 1; desc = 'fake-grids-' + str(train.run_id)
 #train = EasyDict(func='util_scripts.generate_interpolation_video', run_id=0, grid_size=[1,1], duration_sec=90.0, smoothing_sec=1.0); num_gpus = 1; desc = 'interpolation-video-' + str(train.run_id)
 #train = EasyDict(func='util_scripts.generate_training_video', run_id=0, duration_sec=30.0); num_gpus = 1; desc = 'training-video-' + str(train.run_id)
 

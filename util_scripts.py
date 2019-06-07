@@ -20,6 +20,7 @@ import misc
 import tfutil
 import train
 import dataset
+from train import setup_snapshot_image_grid
 
 #----------------------------------------------------------------------------
 # Generate random images or image grids using a previously trained network.
@@ -33,6 +34,10 @@ def generate_fake_images(run_id, snapshot=6560, grid_size=[1,1], num_pngs=1, ima
 
     print('Loading network from "%s"...' % network_pkl)
     G, D, Gs, _, _, _ = misc.load_network_pkl(run_id, snapshot)
+
+    # x = [v for v in tf.global_variables() if 'Gs/lod' in v.name]
+    # for p in x:
+    #     p.load(4)
 
     result_subdir = misc.create_result_subdir(config.result_dir, config.desc)
     for png_idx in range(num_pngs):

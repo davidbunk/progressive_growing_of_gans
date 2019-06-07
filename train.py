@@ -16,6 +16,8 @@ import dataset
 import misc
 import os
 
+from tensorflow.keras.optimizers import SGD
+
 from skimage.exposure import rescale_intensity
 
 os.environ['CUDA_VISIBLE_DEVICES'] = '0, 1'
@@ -142,6 +144,7 @@ def train_progressive_gan(
         minibatch_repeats       = 4,            # Number of minibatches to run in phase 1 before adjusting training parameters.
         minibatch_2_repeats       = 4,            # Number of minibatches to run in phase 2 before adjusting training parameters.
         reset_opt_for_new_lod   = True,         # Reset optimizer internal state (e.g. Adam moments) when new layers are introduced?
+        freeze_prev_lod = True,
         total_kimg              = 15000,        # Total length of the training, measured in thousands of real images.
         mirror_augment          = True,        # Enable mirror augment?
         drange_net              = [-1,1],       # Dynamic range used when feeding image data to the networks.
@@ -150,7 +153,7 @@ def train_progressive_gan(
         save_tf_graph           = False,        # Include full TensorFlow computation graph in the tfevents file?
         save_weight_histograms  = False,        # Include weight histograms in the tfevents file?
         resume_run_id           = None,         # Run ID or network pkl to resume training from, None = start from scratch.
-        resume_snapshot         = None,         # Snapshot index to resume training from, None = autodetect.
+        resume_snapshot         = 0,         # Snapshot index to resume training from, None = autodetect.
         resume_kimg             = 0.0,          # Assumed training progress at the beginning. Affects reporting and training schedule.
         resume_time             = 0.0):         # Assumed wallclock time at the beginning. Affects reporting.
 
@@ -206,12 +209,40 @@ def train_progressive_gan(
     D_opt = tfutil.Optimizer(name='TrainD', learning_rate=lrate_in, **config.D_opt)
 
     # Phase 2 optimizers.
-    #G_2_opt = tfutil.Optimizer(name='TrainG_2', learning_rate=0.0001, **config.G_2_opt)
-    D_2_opt = tfutil.Optimizer(name='TrainD_2', learning_rate=0.001, **config.D_2_opt)
+    G_2_opt = tfutil.Optimizer(name='TrainG_2',  learning_rate=lrate_in, **config.G_2_opt)
+    D_2_opt = tfutil.Optimizer(name='TrainD_2',  learning_rate=lrate_in, **config.D_2_opt)
+
+    sched = TrainingSchedule(total_kimg * 1000, training_set, **config.sched)
+
+    G_trainables = []
+    # G_2_trainables = []
+    # D_trainables = []
+    # D_2_trainables = []
+
+    G_list = []
+    # D_list = []
+    # G_2_list = []
+    # D_2_list = []
 
     for gpu in range(config.num_gpus):
         with tf.name_scope('GPU%d' % gpu), tf.device('/gpu:%d' % gpu):
             # Phase 1 Multi-GPU:
+            # if gpu == 0:
+            #     G_list.append(G)
+            #     # D_list.append(D)
+            #     # G_2_list.append(G_2)
+            #     # D_2_list.append(D_2)
+            # else:
+            #     G_list.append(G.clone(G.name + '_shadow'))
+            #     # D_list.append(D.clone(D.name + '_shadow'))
+            #     # G_2_list.append(G_2.clone(G_2.name + '_shadow'))
+            #     # D_2_list.append(D_2.clone(D_2.name + '_shadow'))
+            # 
+            # G_gpu = G_list[gpu]
+            # # D_gpu = D_list[gpu]
+            # # G_2_gpu = G_2_list[gpu]
+            # # D_2_gpu = D_2_list[gpu]
+
             G_gpu = G if gpu == 0 else G.clone(G.name + '_shadow')
             D_gpu = D if gpu == 0 else D.clone(D.name + '_shadow')
 
@@ -232,30 +263,35 @@ def train_progressive_gan(
 
             # Phase 1
             with tf.name_scope('G_loss'), tf.control_dependencies(lod_assign_ops):
-                G_loss = tfutil.call_func_by_name(G=G_gpu, D=D_gpu, opt=G_opt, training_set=training_set, minibatch_size=minibatch_split, **config.G_loss)
+                G_loss = tfutil.call_func_by_name(G=G_gpu, D=D_gpu, opt=G_opt, training_set=training_set, minibatch_size=minibatch_split, lod=sched.lod, **config.G_loss)
             with tf.name_scope('D_loss'), tf.control_dependencies(lod_assign_ops):
-                D_loss = tfutil.call_func_by_name(G=G_gpu, D=D_gpu, opt=D_opt, training_set=training_set, minibatch_size=minibatch_split, reals=reals_gpu, labels=labels_gpu, **config.D_loss)
+                D_loss = tfutil.call_func_by_name(G=G_gpu, D=D_gpu, opt=D_opt, training_set=training_set, minibatch_size=minibatch_split, reals=reals_gpu, labels=labels_gpu, lod=sched.lod, **config.D_loss)
 
             # Phase 2
             with tf.name_scope('G_2_loss'), tf.control_dependencies(lod_assign_ops_2):
-                G_2_loss = tfutil.call_func_by_name(G=G_2_gpu, D=D_2_gpu, opt=G_opt, training_set=training_set_2, minibatch_size=minibatch_split, G_old=G_gpu, training_set_old=training_set, **config.G_2_loss)
+                G_2_loss = tfutil.call_func_by_name(G=G_2_gpu, D=D_2_gpu, opt=G_2_opt, training_set=training_set_2, minibatch_size=minibatch_split, G_old=G_gpu, training_set_old=training_set, lod=sched.lod, **config.G_2_loss)
             with tf.name_scope('D_2_loss'), tf.control_dependencies(lod_assign_ops_2):
-                D_2_loss = tfutil.call_func_by_name(G=G_2_gpu, D=D_2_gpu, opt=D_2_opt, training_set=training_set_2, minibatch_size=minibatch_split, reals=reals_2_gpu, labels=labels_2_gpu, G_old=G_gpu, training_set_old=training_set, **config.D_2_loss)
+                D_2_loss = tfutil.call_func_by_name(G=G_2_gpu, D=D_2_gpu, opt=D_2_opt, training_set=training_set_2, minibatch_size=minibatch_split, reals=reals_2_gpu, labels=labels_2_gpu, G_old=G_gpu, training_set_old=training_set, lod=sched.lod, **config.D_2_loss)
 
             # Phase 1
-            G_opt.register_gradients(tf.reduce_mean(G_loss) + tf.reduce_mean(G_2_loss), list(G_gpu.trainables.values()) + list(G_2_gpu.trainables.values()))
+            G_opt.register_gradients(tf.reduce_mean(G_loss), G_gpu.trainables)
             D_opt.register_gradients(tf.reduce_mean(D_loss), D_gpu.trainables)
 
             # Phase 2
-            #G_2_opt.register_gradients(tf.reduce_mean(G_2_loss), G_2_gpu.trainables)
+            G_2_opt.register_gradients(tf.reduce_mean(G_2_loss), G_2_gpu.trainables)
             D_2_opt.register_gradients(tf.reduce_mean(D_2_loss), D_2_gpu.trainables)
+
+            G_trainables.append(G_gpu.trainables)
+            # G_2_trainables.append(G_2_gpu.trainables)
+            # D_trainables.append(D_gpu.trainables)
+            # D_2_trainables.append(D_2_gpu.trainables)
 
     # Phase 1
     G_train_op = G_opt.apply_updates()
     D_train_op = D_opt.apply_updates()
 
     # Phase 2
-    #G_2_train_op = G_2_opt.apply_updates()
+    G_2_train_op = G_2_opt.apply_updates()
     D_2_train_op = D_2_opt.apply_updates()
 
     print('Setting up snapshot image grid...')
@@ -301,16 +337,54 @@ def train_progressive_gan(
         training_set.configure(sched.minibatch, sched.lod)
 
         # Phase 2
-        sched_2 = TrainingSchedule(cur_nimg, training_set_2, **config.sched)
+        sched_2 = TrainingSchedule(cur_nimg, training_set_2, G_lrate_base=0.0001, D_lrate_base=0.0004, **config.sched)
         training_set_2.configure(sched_2.minibatch, sched_2.lod)
+
+        if 0 == 1:
+            if np.floor(sched.lod) != np.floor(prev_lod) or np.ceil(sched.lod) != np.ceil(prev_lod):
+                for gpu in range(config.num_gpus):
+                    with tf.name_scope('GPU%d' % gpu), tf.device('/gpu:%d' % gpu):
+                        G_gpu = G_list[gpu]
+                        #D_gpu = D_list[gpu]
+                        #G_2_gpu = G_2_list[gpu]
+                        #D_2_gpu = D_2_list[gpu]
+
+                        if sched.lod >= 6:
+                            print(sched.lod)
+                            G_vars = [G_gpu.vars[x] for x in G_trainables[gpu]]
+                            #D_vars = [D_gpu.vars[x] for x in D_trainables[gpu] if 'Grow_lod' + str(sched.lod) in x or 'base' in x]
+
+                            print(G_vars)
+
+                            #G_2_vars = [G_2_gpu.vars[x] for x in G_2_trainables[gpu] if 'Grow_lod' + str(sched.lod) in x or 'base' in x or 'Grow_lod7' in x or 'Grow_lod8' in x]
+                            #D_2_vars = [D_2_gpu.vars[x] for x in D_2_trainables[gpu] if 'Grow_lod' + str(sched.lod) in x or 'base' in x]
+                        else:
+                            print(sched.lod)
+                            G_vars = [G_gpu.vars[x] for x in G_trainables[gpu] if 'Grow_lod' + str(int(sched.lod + 1)) not in x and 'Grow_lod' + str(int(sched.lod + 2)) not in x and 'Grow_lod' + str(int(sched.lod + 3)) not in x and 'Grow_lod' + str(int(sched.lod + 4)) not in x and 'Grow_lod' + str(int(sched.lod + 5)) not in x and 'Grow_lod' + str(int(sched.lod + 6)) not in x and 'Grow_lod' + str(int(sched.lod + 7)) not in x and 'Grow_lod' + str(int(sched.lod + 8)) not in x and 'Grow_lod' + str(int(sched.lod + 9)) not in x and 'Grow_lod' + str(int(sched.lod + 10)) not in x]
+                            #D_vars = [D_gpu.vars[x] for x in D_trainables[gpu] if 'Grow_lod' + str(sched.lod) in x]
+
+                            print(G_vars)
+
+                            #G_2_vars = [G_2_gpu.vars[x] for x in G_2_trainables[gpu] if 'Grow_lod' + str(sched.lod) in x]
+                            #D_2_vars = [D_2_gpu.vars[x] for x in D_2_trainables[gpu] if 'Grow_lod' + str(sched.lod) in x]
+
+                        G_opt.register_gradients(tf.reduce_mean(G_loss), G_vars)
+                        #D_opt.register_gradients(tf.reduce_mean(D_loss), D_vars)
+
+                        #G_2_opt.register_gradients(tf.reduce_mean(G_2_loss), G_2_vars)
+                        #D_2_opt.register_gradients(tf.reduce_mean(D_2_loss), D_2_vars)
+
+                G_train_op = G_opt.apply_updates()
+                #D_train_op = D_opt.apply_updates()
+                #G_2_train_op = G_2_opt.apply_updates()
+                #D_2_train_op = D_2_opt.apply_updates()
 
         if reset_opt_for_new_lod:
             if np.floor(sched.lod) != np.floor(prev_lod) or np.ceil(sched.lod) != np.ceil(prev_lod):
                 # Phase 1
                 G_opt.reset_optimizer_state(); D_opt.reset_optimizer_state()
                 # Phase 2
-                #G_2_opt.reset_optimizer_state(); D_2_opt.reset_optimizer_state()
-                D_2_opt.reset_optimizer_state()
+                G_2_opt.reset_optimizer_state(); D_2_opt.reset_optimizer_state()
         prev_lod = sched.lod
 
         # Run training ops.
@@ -321,7 +395,7 @@ def train_progressive_gan(
                 tfutil.run([D_2_train_op, Gs_2_update_op], {lod_in: sched_2.lod, lrate_in: sched_2.D_lrate, minibatch_in: sched_2.minibatch})
                 cur_nimg += sched_2.minibatch
             tfutil.run([G_train_op], {lod_in: sched.lod, lrate_in: sched.G_lrate, minibatch_in: sched.minibatch})
-            #tfutil.run([G_2_train_op], {lod_in: sched_2.lod, lrate_in: sched_2.G_lrate, minibatch_in: sched_2.minibatch})
+            tfutil.run([G_2_train_op], {lod_in: sched_2.lod, lrate_in: sched_2.G_lrate, minibatch_in: sched_2.minibatch})
             # for duck in range(1):
             #     for quack in range(D_2_repeats):
             #         tfutil.run([D_2_train_op, Gs_2_update_op], {lod_in: sched_2.lod, lrate_in: sched_2.D_lrate, minibatch_in: sched_2.minibatch})
@@ -362,9 +436,9 @@ def train_progressive_gan(
             # Save snapshots.
             if cur_tick % image_snapshot_ticks == 0 or done:
                 # Phase 1
-                grid_fakes = Gs.run(grid_latents, grid_labels, minibatch_size=sched.minibatch//config.num_gpus)
+                grid_fakes = Gs.run(grid_latents, grid_labels, minibatch_size=sched.minibatch//config.num_gpus, crop=True)
                 misc.save_image_grid(grid_fakes, os.path.join(result_subdir, 'fake_labels%06d.png' % (cur_nimg // 1000)), drange=drange_net, grid_size=grid_size)
-                grid_fakes = rescale_intensity(grid_fakes, out_range=(1, 3))
+                #grid_fakes = rescale_intensity(grid_fakes, out_range=(1, 3))
                 # Phase 2
                 grid_fakes_2 = Gs_2.run(grid_latents_2, grid_labels_2, grid_fakes, minibatch_size=sched_2.minibatch//config.num_gpus)
                 misc.save_image_grid(grid_fakes_2, os.path.join(result_subdir, 'fake_images%06d.png' % (cur_nimg // 1000)), drange=drange_net, grid_size=grid_size_2)
